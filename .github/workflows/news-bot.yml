@@ -2,8 +2,8 @@ name: news-bot
 
 on:
   schedule:
-    - cron: "*/10 * * * *"
-  workflow_dispatch:
+    - cron: "*/10 * * * *"   # каждые 10 минут (GitHub иногда запускает с задержкой)
+  workflow_dispatch:          # кнопка ручного запуска
 
 permissions:
   contents: write
@@ -25,11 +25,10 @@ jobs:
         env:
           TG_TOKEN: ${{ secrets.TG_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          MIN_SCORE: ${{ vars.MIN_SCORE || '3' }}
+          ONLY_KEYWORDS: ${{ vars.ONLY_KEYWORDS }}
       - name: Save state
         run: |
           git config user.name "news-bot"
           git config user.email "news-bot@users.noreply.github.com"
           git add seen.json
-          git diff --cached --quiet || (git commit -m "update seen" && git pull --rebase && git push)
+          git diff --cached --quiet || (git commit -m "update seen" && git push)
