@@ -93,13 +93,50 @@ STATE_FILE = os.environ.get("STATE_FILE", "seen.json")
 MAX_PER_CYCLE = 40
 DESC_LIMIT = 600
 
-REUTERS_QUERY = "site:reuters.com (markets OR business OR economy OR stocks) when:1d"
+def gnews(query, lang="en", country="US"):
+    return "https://news.google.com/rss/search?" + urllib.parse.urlencode(
+        {"q": query, "hl": f"{lang}-{country}", "gl": country, "ceid": f"{country}:{lang}"})
+
+
+# Для каждого источника — несколько адресов: берётся первый, который отдаёт новости
 FEEDS = [
-    ("Investing", "https://www.investing.com/rss/news.rss"),
+    ("Investing", ["https://www.investing.com/rss/news.rss"]),
     # У Reuters нет публичного RSS, берём их статьи через Google News
-    ("Reuters", "https://news.google.com/rss/search?" + urllib.parse.urlencode(
-        {"q": REUTERS_QUERY, "hl": "en-US", "gl": "US", "ceid": "US:en"})),
-    ("Yahoo Finance", "https://finance.yahoo.com/news/rssindex"),
+    ("Reuters", [gnews("site:reuters.com (markets OR business OR economy OR stocks) when:1d")]),
+    ("Yahoo Finance", [
+        "https://finance.yahoo.com/rss/topstories",
+        "https://finance.yahoo.com/news/rss",
+        "https://feeds.finance.yahoo.com/rss/2.0/headline?s=%5EGSPC,%5EIXIC,%5EKS11,EWY&region=US&lang=en-US",
+        gnews("site:finance.yahoo.com when:1d"),
+    ]),
+    ("CNBC", [
+        "https://www.cnbc.com/id/20910258/device/rss/rss.html",   # Economy
+        gnews("site:cnbc.com (markets OR economy OR stocks) when:1d"),
+    ]),
+    ("CNBC Markets", [
+        "https://www.cnbc.com/id/15839069/device/rss/rss.html",
+    ]),
+    ("CNBC Asia", [
+        "https://www.cnbc.com/id/19832390/device/rss/rss.html",
+    ]),
+    # Корея
+    ("Yonhap", [
+        "https://en.yna.co.kr/RSS/economy.xml",
+        "https://en.yna.co.kr/RSS/market.xml",
+        gnews("site:en.yna.co.kr (economy OR market OR stocks) when:1d"),
+    ]),
+    ("SBS Biz", [
+        gnews("site:biz.sbs.co.kr when:1d", "ko", "KR"),
+    ]),
+    # Казахстан
+    ("Kursiv", [
+        "https://kz.kursiv.media/feed/",
+        gnews("site:kz.kursiv.media when:1d", "ru", "KZ"),
+    ]),
+    ("Kapital.kz", [
+        "https://kapital.kz/rss",
+        gnews("site:kapital.kz when:1d", "ru", "KZ"),
+    ]),
 ]
 CALENDAR_URL = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
 
@@ -119,8 +156,9 @@ SYSTEM_PROMPT = """Ты — ассистент аналитика инвестф
 фонда корейских акций (Vitis Korea Fund), также следит за Казахстаном (KASE, тенге, \
 нефть, уран), США (Fed, CPI, S&P 500, крупный тех) и Японией (BoJ, иена).
 
-Тебе дают список новостей. Для КАЖДОЙ верни объект JSON:
+Тебе дают список новостей (на английском, корейском или русском). Для КАЖДОЙ верни объект JSON:
 - "i": номер новости
+- "title_ru": перевод заголовка на русский, ТОЛЬКО если он на корейском; иначе ""
 - "score": важность для неё от 1 до 5:
    5 — двигает рынки прямо сейчас: решение Fed/BoJ/BoK/НБК, неожиданный CPI/NFP, \
 шок на рынке, крупное событие по бумаге из watchlist
@@ -277,10 +315,11 @@ def page_description(url):
 
 def tidy(item):
     title = item["title"]
-    if item["source"] == "Reuters":
-        title = re.sub(r"\s+-\s+Reuters$", "", title)
+    via_google = "news.google.com" in item["link"]
+    if via_google:  # Google News дописывает " - Reuters" / " - Yahoo Finance"
+        title = re.sub(r"\s+-\s+[^-]{2,40}$", "", title)
     desc = item["desc"]
-    if desc and (item["source"] == "Reuters" or desc.lower().startswith(title[:40].lower())):
+    if desc and (via_google or desc.lower().startswith(title[:40].lower())):
         desc = ""
     if not desc:
         desc = page_description(item["link"])
@@ -360,6 +399,8 @@ def score_items(items, recent_titles):
         w = r.get("watch") or []
         it["watch"] = sorted(set(it["watch"]) | {x for x in w if x in WATCHLIST})
         it["dup"] = bool(r.get("dup"))
+        if r.get("title_ru"):
+            it["title"] = str(r["title_ru"])
         it["ai"] = True
     return items
 
@@ -545,11 +586,18 @@ def save_state(state):
 def check_news(state, now):
     now_ts = int(now.timestamp())
     fresh = []
-    for source, url in FEEDS:
-        try:
-            items = parse_feed(fetch(url))
-        except Exception as e:
-            print(f"[{source}] не загрузился: {e}", file=sys.stderr)
+    for source, urls in FEEDS:
+        items, errors = None, []
+        for url in urls:
+            try:
+                items = parse_feed(fetch(url))
+                if items:
+                    break
+                errors.append(f"{url[:60]}: пусто")
+            except Exception as e:
+                errors.append(f"{url[:60]}: {e}")
+        if not items:
+            print(f"[{source}] не загрузился: {'; '.join(errors)}", file=sys.stderr)
             continue
         first_time = source not in state["feeds"]
         for it in items:
