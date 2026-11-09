@@ -119,6 +119,16 @@ FEEDS = [
     ("CNBC Asia", [
         "https://www.cnbc.com/id/19832390/device/rss/rss.html",
     ]),
+    ("The Economist", [
+        "https://www.economist.com/finance-and-economics/rss.xml",
+        gnews("site:economist.com (finance OR economics OR markets) when:2d"),
+    ]),
+    ("The Economist Business", [
+        "https://www.economist.com/business/rss.xml",
+    ]),
+    ("The Economist Asia", [
+        "https://www.economist.com/asia/rss.xml",
+    ]),
     # Корея
     ("Yonhap", [
         "https://en.yna.co.kr/RSS/economy.xml",
@@ -635,19 +645,32 @@ def check_news(state, now):
 
     quiet = in_quiet(now)
     sent = queued = dropped = 0
+    log = []
+    for it in fresh:
+        if it not in unique:
+            log.append(("   ", "ДУБЛЬ (заголовок)", it))
     for it in scored:
         state["recent"].append({"title": it["title"], "ts": now_ts})
         if it["dup"] or it["score"] < DROP_BELOW:
             dropped += 1
+            log.append((f"{it['score']}/5", "ДУБЛЬ (ИИ)" if it["dup"] else "отброшено", it))
             continue
         if it["score"] >= MIN_SCORE and (not quiet or it["score"] == 5):
             send(format_news(it))
             sent += 1
+            log.append((f"{it['score']}/5", "→ ОТПРАВЛЕНО", it))
             time.sleep(1.1)
         else:
             state["queue"].append({k: it[k] for k in
                                    ("title", "link", "score", "summary", "watch", "ts", "source")})
             queued += 1
+            log.append((f"{it['score']}/5", "в дайджест", it))
+    print("─" * 60)
+    for sc, what, it in sorted(log, key=lambda x: x[0], reverse=True):
+        print(f"{sc}  {what:<18} [{it['source']}] {it['title'][:90]}")
+    print("─" * 60)
+    if scored and not scored[0].get("ai"):
+        print("⚠️ Оценка по ключевым словам (ИИ не ответил или нет ключа)")
     print(f"{now:%H:%M} новых {len(fresh)}, дублей {len(fresh) - len(unique)}, "
           f"отправлено {sent}, в дайджест {queued}, отброшено {dropped}")
 
