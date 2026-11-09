@@ -25,10 +25,11 @@ jobs:
         env:
           TG_TOKEN: ${{ secrets.TG_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-          ONLY_KEYWORDS: ${{ vars.ONLY_KEYWORDS }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          MIN_SCORE: ${{ vars.MIN_SCORE || '3' }}
       - name: Save state
         run: |
           git config user.name "news-bot"
           git config user.email "news-bot@users.noreply.github.com"
           git add seen.json
-          git diff --cached --quiet || (git commit -m "update seen" && git push)
+          git diff --cached --quiet || (git commit -m "update seen" && git pull --rebase && git push)
