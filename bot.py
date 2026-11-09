@@ -3,7 +3,7 @@
 FinNews Bot v2 — Investing.com, Reuters, Yahoo Finance → Telegram.
 
 Что умеет:
-  1. Claude оценивает важность каждой новости (1–5) и пишет суть по-русски
+  1. ИИ (Gemini или Claude) оценивает важность каждой новости (1–5) и пишет суть по-русски
   2. Сразу присылает только важные (оценка ≥ MIN_SCORE), остальное — в дайджест
   3. Склеивает дубли: одна история с разных сайтов приходит один раз
   4. Помечает 📌 новости про бумаги из WATCHLIST
@@ -16,7 +16,8 @@ FinNews Bot v2 — Investing.com, Reuters, Yahoo Finance → Telegram.
 
 Секреты (переменные окружения):
   TG_TOKEN, TG_CHAT_ID   — обязательно
-  ANTHROPIC_API_KEY      — для ИИ-оценки (без него бот работает по ключевым словам)
+  GEMINI_API_KEY         — бесплатный ИИ от Google (aistudio.google.com)
+  ANTHROPIC_API_KEY      — или Claude (платно); без ключей — оценка по ключевым словам
 Необязательные:
   MIN_SCORE (по умолчанию 3), INTERVAL_SEC (300), STATE_FILE (seen.json)
 """
@@ -76,7 +77,8 @@ CUSTOM_EVENTS = [
     # График НБК и Банка Кореи на 2027 год ещё не опубликован — добавить, когда выйдет
 ]
 
-MODEL = "claude-haiku-5-5"
+MODEL = "claude-haiku-5-5"                # если используется Claude
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash-lite")  # бесплатный Gemini
 LOCAL_TZ = timezone(timedelta(hours=5))  # Алматы
 
 # ═════════════════════════════════════════════════════════════════
@@ -84,6 +86,8 @@ LOCAL_TZ = timezone(timedelta(hours=5))  # Алматы
 TOKEN = os.environ.get("TG_TOKEN", "")
 CHAT_ID = os.environ.get("TG_CHAT_ID", "")
 API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "")
+AI_ON = bool(GEMINI_KEY or API_KEY)
 INTERVAL = int(os.environ.get("INTERVAL_SEC", "300"))
 STATE_FILE = os.environ.get("STATE_FILE", "seen.json")
 MAX_PER_CYCLE = 40
@@ -99,7 +103,7 @@ FEEDS = [
 ]
 CALENDAR_URL = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
 
-# Запасной вариант оценки, если нет ключа Claude или он не ответил
+# Запасной вариант оценки, если нет ключа ИИ или он не ответил
 KEYWORDS = [
     "fed", "fomc", "powell", "rate cut", "rate hike", "interest rate", "cpi", "ppi",
     "inflation", "payroll", "jobs report", "gdp", "recession", "treasury", "yield",
@@ -163,29 +167,46 @@ def send(text, retry=True):
         print(f"Telegram error {e.code}: {body}", file=sys.stderr)
 
 
-def ask_claude(system, user, max_tokens=4000):
-    body = json.dumps({
-        "model": MODEL, "max_tokens": max_tokens, "system": system,
-        "messages": [{"role": "user", "content": user}],
-    }).encode()
-    req = urllib.request.Request("https://api.anthropic.com/v1/messages", data=body, headers={
-        "x-api-key": API_KEY, "anthropic-version": "2023-06-01",
-        "content-type": "application/json",
-    })
+def ask_ai(system, user, max_tokens=4000):
+    """Gemini (бесплатно), если задан GEMINI_API_KEY, иначе Claude."""
+    if GEMINI_KEY:
+        name = "Gemini"
+        body = json.dumps({
+            "systemInstruction": {"parts": [{"text": system}]},
+            "contents": [{"role": "user", "parts": [{"text": user}]}],
+            "generationConfig": {"maxOutputTokens": max_tokens, "temperature": 0.2},
+        }).encode()
+        req = urllib.request.Request(
+            f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent",
+            data=body, headers={"x-goog-api-key": GEMINI_KEY, "content-type": "application/json"})
+        extract = lambda resp: "".join(
+            p.get("text", "") for c in resp.get("candidates", [])[:1]
+            for p in c.get("content", {}).get("parts", []))
+    else:
+        name = "Claude"
+        body = json.dumps({
+            "model": MODEL, "max_tokens": max_tokens, "system": system,
+            "messages": [{"role": "user", "content": user}],
+        }).encode()
+        req = urllib.request.Request("https://api.anthropic.com/v1/messages", data=body, headers={
+            "x-api-key": API_KEY, "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        })
+        extract = lambda resp: "".join(b.get("text", "") for b in resp.get("content", []))
     for attempt in range(3):
         try:
             with urllib.request.urlopen(req, timeout=120) as r:
                 resp = json.load(r)
-            return "".join(b.get("text", "") for b in resp.get("content", []))
+            return extract(resp)
         except urllib.error.HTTPError as e:
             msg = e.read().decode("utf-8", "ignore")
-            print(f"Claude error {e.code}: {msg[:300]}", file=sys.stderr)
+            print(f"{name} error {e.code}: {msg[:300]}", file=sys.stderr)
             if e.code in (429, 500, 502, 503, 529) and attempt < 2:
                 time.sleep(10 * (attempt + 1))
                 continue
             return None
         except Exception as e:
-            print(f"Claude error: {e}", file=sys.stderr)
+            print(f"{name} error: {e}", file=sys.stderr)
             return None
 
 
@@ -316,7 +337,7 @@ def score_items(items, recent_titles):
     for it in items:  # значения по умолчанию = запасной режим
         it.update(score=keyword_score(it), summary=it["desc"][:350], impact="",
                   watch=watch_hits(f"{it['title']} {it['desc']}"), dup=False, ai=False)
-    if not API_KEY or not items:
+    if not AI_ON or not items:
         return items
 
     lines = [f"[{i}] ({it['source']}) {it['title']}\n{it['desc'][:DESC_LIMIT]}"
@@ -324,9 +345,9 @@ def score_items(items, recent_titles):
     recent = "\n".join(f"- {t}" for t in recent_titles[-40:]) or "(пусто)"
     user = f"Недавно отправлено:\n{recent}\n\nНовые новости:\n\n" + "\n\n".join(lines)
     system = SYSTEM_PROMPT.replace("{watchlist}", ", ".join(WATCHLIST))
-    result = extract_json(ask_claude(system, user, max_tokens=150 * len(items) + 500))
+    result = extract_json(ask_ai(system, user, max_tokens=150 * len(items) + 500))
     if not isinstance(result, list):
-        print("Claude не вернул JSON — использую ключевые слова", file=sys.stderr)
+        print("ИИ не вернул JSON — использую ключевые слова", file=sys.stderr)
         return items
     for r in result:
         try:
@@ -406,9 +427,9 @@ def send_digest(state, now):
     title = "🌅 Утренний дайджест" if now.hour < 12 else "🌆 Вечерний дайджест"
     parts = [f"<b>{title}</b> · {len(queue)} новостей"]
 
-    if API_KEY:
+    if AI_ON:
         lst = "\n".join(f"- ({q['score']}/5) {q['title']}: {q['summary']}" for q in queue[:40])
-        brief = ask_claude(
+        brief = ask_ai(
             "Ты — ассистент аналитика корейских и казахстанских акций. Напиши по-русски "
             "3–5 коротких пунктов «главное», каждый с новой строки и начиная с «• ». "
             "Только факты из списка, без вступления.", lst, max_tokens=600)
@@ -561,7 +582,7 @@ def check_news(state, now):
             continue
         unique.append(it)
 
-    # 2) оценка Claude (+ он же ловит дубли, сформулированные иначе)
+    # 2) оценка ИИ (+ он же ловит дубли, сформулированные иначе)
     scored = score_items(unique, recent_titles)
 
     quiet = in_quiet(now)
@@ -596,15 +617,15 @@ def run_once(state):
 def main():
     if not TOKEN or not CHAT_ID:
         sys.exit("Укажите TG_TOKEN и TG_CHAT_ID")
-    if not API_KEY:
-        print("ANTHROPIC_API_KEY не задан — оценка по ключевым словам", file=sys.stderr)
+    if not AI_ON:
+        print("Ключ ИИ не задан — оценка по ключевым словам", file=sys.stderr)
     state = load_state()
     if not state.get("v2"):
         send("✅ <b>FinNews Bot v2 запущен</b>\n"
              f"Сразу присылаю новости с оценкой {MIN_SCORE}/5 и выше, остальное — в дайджесте "
              f"в {', '.join(f'{h}:00' for h in DIGEST_HOURS)}. "
              f"Тихие часы {QUIET_FROM}:00–{QUIET_TO:02d}:00 (кроме 🚨 5/5)."
-             + ("" if API_KEY else "\n⚠️ Ключ Claude не задан — оцениваю по ключевым словам."))
+             + ("" if AI_ON else "\n⚠️ Ключ ИИ не задан — оцениваю по ключевым словам."))
         state["v2"] = True
     while True:
         run_once(state)
