@@ -85,6 +85,7 @@ LOCAL_TZ = timezone(timedelta(hours=5))  # Алматы
 
 TOKEN = os.environ.get("TG_TOKEN", "")
 CHAT_ID = os.environ.get("TG_CHAT_ID", "")
+CHAT_IDS = [c.strip() for c in CHAT_ID.split(",") if c.strip()]  # можно несколько через запятую
 API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "")
 AI_ON = bool(GEMINI_KEY or API_KEY)
@@ -195,11 +196,17 @@ def fetch(url, timeout=20):
         return r.read()
 
 
-def send(text, retry=True):
+def send(text):
+    """Отправляет сообщение во все чаты из TG_CHAT_ID (через запятую)."""
     if len(text) > 4000:
         text = text[:3990] + "…"
+    for chat in CHAT_IDS:
+        send_one(chat, text)
+
+
+def send_one(chat, text, retry=True):
     data = urllib.parse.urlencode({
-        "chat_id": CHAT_ID, "text": text, "parse_mode": "HTML",
+        "chat_id": chat, "text": text, "parse_mode": "HTML",
         "disable_web_page_preview": "true",
     }).encode()
     req = urllib.request.Request(f"https://api.telegram.org/bot{TOKEN}/sendMessage", data=data)
@@ -211,8 +218,10 @@ def send(text, retry=True):
         if e.code == 429 and retry:
             wait = json.loads(body).get("parameters", {}).get("retry_after", 5)
             time.sleep(wait + 1)
-            return send(text, retry=False)
-        print(f"Telegram error {e.code}: {body}", file=sys.stderr)
+            return send_one(chat, text, retry=False)
+        print(f"Telegram error {e.code} для {chat}: {body}", file=sys.stderr)
+    except Exception as e:
+        print(f"Telegram error для {chat}: {e}", file=sys.stderr)
 
 
 def ask_ai(system, user, max_tokens=4000):
