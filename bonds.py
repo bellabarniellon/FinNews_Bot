@@ -132,7 +132,9 @@ UST_URL = ("https://home.treasury.gov/resource-center/data-chart-center/interest
            "{y}/all?type=daily_treasury_yield_curve&field_tdr_date_value={y}&page&_format=csv")
 BOND_URL = "https://kase.kz/ru/investors/bonds/{code}"
 FRESH_DAYS_CORP = 30   # цена считается актуальной, если последняя сделка/котировка не старше
-FRESH_DAYS_GOV = 60
+FRESH_DAYS_GOV = 30
+MIN_YEARS = 0.25        # бумаги ближе 3 мес. к погашению — в средние и топы не берём (доходность шумная)
+ANOMALY_BP = -300       # спред ниже −300 бп к своей кривой — подозрительно (валютная индексация / случайная цена)
 
 
 def fetch_json(url):
@@ -263,8 +265,12 @@ TENORS = [0.5, 1, 2, 3, 5, 7, 10]
 def build_report(now, prev):
     import numpy as np
     corp, gov, muni, ust_kase = load_kase(now)
+    # индексируемые на инфляцию ГЦБ (МЕИКАМ/МУИКАМ: тикеры MTC/MTM/MUJ…, купон 1–3%) дают другую доходность —
+    # в номинальную кривую их не берём
+    indexed = re.compile(r"^(MTC|MTM|MUJ|MKJ|MEJ)", re.I)
     gov_pts = [(b["years"], b["yield"]) for b in gov
-               if is_fresh(b, now, FRESH_DAYS_GOV) and b["years"] and 0.05 < b["years"] < 31]
+               if is_fresh(b, now, FRESH_DAYS_GOV) and b["years"] and 0.05 < b["years"] < 31
+               and not indexed.match(b["ticker"]) and not (b["coupon"] is not None and 0 < b["coupon"] < 3)]
     if len(gov_pts) < 5:
         raise RuntimeError(f"мало ГЦБ с актуальной доходностью ({len(gov_pts)}) — кривую не построить")
     kzt, kzt_rmse, kzt_n = robust_fit(gov_pts)
@@ -297,14 +303,26 @@ def build_report(now, prev):
         return sorted(((s, len(v), float(np.mean([x["yield"] for x in v])), float(np.median([x["g"] for x in v])))
                        for s, v in groups.items()), key=lambda r: -r[3])
 
-    kzt_live = [b for b in universe if b["currency"] == "KZT" and b["fresh"] and b["g"] is not None
-                and 0.05 < b["years"] < 31 and abs(b["g"]) < 3000]
-    usd_live = [b for b in universe if b["currency"] == "USD" and b["fresh"] and b["g"] is not None
-                and 0.05 < b["years"] < 31 and abs(b["g"]) < 3000]
+    def flag(b):
+        if b["years"] is not None and b["years"] < MIN_YEARS:
+            return "до погашения < 3 мес."
+        if b["g"] is not None and b["g"] < ANOMALY_BP:
+            return "доходность намного ниже кривой — проверить (валютная индексация / случайная цена)"
+        if b["g"] is not None and b["g"] > 3000:
+            return "аномально высокая доходность"
+        return ""
+    for b in universe:
+        b["flag"] = flag(b) if b["fresh"] and b["g"] is not None else ""
+
+    def clean_set(cur):
+        return [b for b in universe if b["currency"] == cur and b["fresh"] and b["g"] is not None
+                and not b["flag"] and b["years"] < 31]
+    kzt_live, usd_live = clean_set("KZT"), clean_set("USD")
+    anomalies = [b for b in universe if b["flag"] and b["flag"] != "до погашения < 3 мес."]
     no_deals = [b for b in universe if not b["fresh"]]
     return {"kzt": kzt, "kzt_rmse": kzt_rmse, "kzt_n": kzt_n, "usd": usd, "ust_date": ust_date,
             "ust_pts": ust_pts or [], "gov": gov_pts, "points": {t: curve(t) for t in TENORS},
-            "kzt_live": kzt_live, "usd_live": usd_live, "no_deals": no_deals, "all": universe, "gov_all": gov,
+            "kzt_live": kzt_live, "usd_live": usd_live, "no_deals": no_deals, "anomalies": anomalies, "all": universe, "gov_all": gov,
             "kzt_sectors": sector_table(kzt_live), "usd_sectors": sector_table(usd_live), "prev": prev}
 
 
@@ -369,7 +387,7 @@ def build_excel(rep, date_str):
     cols = [("Тикер", 12), ("Эмитент", 30), ("Сектор", 16), ("Площадка", 14), ("Валюта", 8), ("Купон, %", 9),
             ("Погашение", 11), ("Лет до погаш.", 10), ("Доходность, %", 12), ("G-спред, бп", 11),
             ("Купон − кривая, бп", 14), ("Цена, %", 9), ("Bid", 9), ("Offer", 9), ("Посл. цена", 11),
-            ("Размещено, ₸", 16), ("Объём выпуска, ₸", 16), ("ISIN", 14), ("Карточка KASE", 40)]
+            ("Размещено, ₸", 16), ("Объём выпуска, ₸", 16), ("ISIN", 14), ("Примечание", 40), ("Карточка KASE", 40)]
     sheets = [
         ("KZT с ценой", [b for b in rep["all"] if b["currency"] == "KZT" and b["fresh"]], "g"),
         ("KZT без сделок", [b for b in rep["all"] if b["currency"] == "KZT" and not b["fresh"]], "cg"),
@@ -395,12 +413,12 @@ def build_excel(rep, date_str):
                     round(b["g"]) if b.get("g") is not None else None,
                     round(b["cg"]) if b.get("cg") is not None else None,
                     b["price"], b["bid"], b["offer"], b["last"].strftime("%d.%m.%Y") if b["last"] else None,
-                    b["placed"], b["issued"], b["isin"], BOND_URL.format(code=b["ticker"])]
+                    b["placed"], b["issued"], b["isin"], b.get("flag", ""), BOND_URL.format(code=b["ticker"])]
             for i, v in enumerate(vals, 1):
                 c = ws.cell(row=r, column=i, value=v)
                 if i in (16, 17):
                     c.number_format = "#,##0"
-            ws.cell(row=r, column=19).hyperlink = BOND_URL.format(code=b["ticker"])
+            ws.cell(row=r, column=20).hyperlink = BOND_URL.format(code=b["ticker"])
         ws.freeze_panes = "C2"
         ws.auto_filter.ref = f"A1:{get_column_letter(len(cols))}{max(2, len(bonds) + 1)}"
     buf = io.BytesIO()
@@ -461,8 +479,14 @@ def report_texts(rep, date_str, coupons):
     if coupons:
         parts.append(f"💸 <b>Купоны за день</b> ({len(coupons)})\n" + "\n".join(
             f'▫️ <a href="{html.escape(c["link"])}">{esc(c["title"])}</a>' for c in coupons[:20]))
-    parts.append(f"<i>Кривая ГЦБ по {rep['kzt_n']} выпускам, точность ±{rep['kzt_rmse'] * 100:.0f} бп. "
-                 f"В средних — бумаги с ценой не старше {FRESH_DAYS_CORP} дней.</i>")
+    if rep["anomalies"]:
+        parts.append(f"⚠️ <b>Исключены как подозрительные: {len(rep['anomalies'])}</b> — " + ", ".join(
+            f"{esc(b['ticker'])} ({fmt_pct(b['yield'])})" for b in rep["anomalies"][:8])
+            + ("…" if len(rep["anomalies"]) > 8 else "") + "\n<i>Скорее всего валютная индексация или случайная "
+            "цена сделки. В Excel помечены в колонке «Примечание».</i>")
+    parts.append(f"<i>Кривая ГЦБ по {rep['kzt_n']} выпускам со сделками за {FRESH_DAYS_GOV} дней, "
+                 f"точность ±{rep['kzt_rmse'] * 100:.0f} бп. В средних — бумаги с ценой не старше "
+                 f"{FRESH_DAYS_CORP} дней и сроком от 3 мес.</i>")
     return caption, "\n\n".join(parts)
 
 
