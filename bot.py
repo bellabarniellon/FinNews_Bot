@@ -16,6 +16,7 @@ Vitis News Bot v3 — новости по трём каналам: 🇰🇿 Viti
 Секреты:
   TG_TOKEN                     — токен бота (обязательно)
   TG_CHAT_KZ / TG_CHAT_KR / TG_CHAT_US — каналы (@имя или -100...; можно несколько через запятую)
+                                 или темы одной группы: -100XXXXXXXXXX:номер_темы
   TG_CHAT_ID                   — личный чат для служебных сообщений; если канал не задан, его новости идут сюда
   GEMINI_API_KEY               — бесплатный ИИ (или ANTHROPIC_API_KEY — Claude)
 """
@@ -84,7 +85,10 @@ CUSTOM_EVENTS = [
 ]
 
 MODEL = "claude-haiku-5-5"
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash-lite")
+# Модели Gemini по очереди: если первая недоступна (404) или исчерпан лимит (429), берётся следующая
+GEMINI_MODELS = [m for m in [os.environ.get("GEMINI_MODEL", "")] if m] + [
+    "gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-flash-lite-latest",
+    "gemini-2.5-flash-lite", "gemini-flash-latest"]
 LOCAL_TZ = timezone(timedelta(hours=5))
 
 # ═════════════════════════════════════════════════════════════════
@@ -97,7 +101,8 @@ AI_ON = bool(GEMINI_KEY or API_KEY)
 INTERVAL = int(os.environ.get("INTERVAL_SEC", "300"))
 STATE_FILE = os.environ.get("STATE_FILE", "seen.json")
 MAX_PER_CYCLE = 150
-AI_CHUNK = 30
+AI_CHUNK = 10          # маленькие пачки — ответ ИИ не обрезается
+MAX_AI_RETRIES = 3     # сколько раз пытаться оценить новость, если ИИ не ответил
 DESC_LIMIT = 600
 
 
@@ -194,14 +199,16 @@ SYSTEM_PROMPT = """Ты — редактор новостной ленты дл�
 Нужны ТОЛЬКО НОВОСТИ про компании и макро: события, решения, отчёты, сделки, данные, \
 движения рынков. НЕ нужны: колонки и мнения, аналитические эссе и разборы «почему», \
 советы инвесторам, «какие акции купить», личные финансы, обзоры продуктов, лайфстайл, \
-интервью без новостей, промо, спорт.
+интервью без новостей, промо, спорт, новинки и рестайлинг моделей авто/гаджетов, \
+фото и слухи о продуктах без финансового эффекта для компании.
 
 Для КАЖДОЙ новости верни объект JSON:
 - "i": номер
 - "kind": "company" (новость компании), "macro" (экономика, центробанки, данные, \
 политика с влиянием на экономику), "market" (движения индексов, валют, сырья, облигаций), \
 или "other" (всё, что не новость — такое мы НЕ публикуем)
-- "region": "KZ" (Казахстан/Центральная Азия), "KR" (Корея), "US" (США и всё глобальное)
+- "region": о какой стране новость (не где опубликована!): "KZ" (Казахстан/Центральная Азия), \
+"KR" (Корея и корейские компании), "US" (США и всё глобальное). Казахстанский сайт про Hyundai → "KR"
 - "score": важность 1–5:
    5 — двигает рынки сейчас: решение Fed/BoJ/BoK/НБК, неожиданные CPI/NFP, шок на рынке, \
 крупное событие по бумаге из watchlist
@@ -255,11 +262,17 @@ def tg(method, params, retry=True):
     return None
 
 
+def target(chat):
+    """'-100123:5' → chat_id -100123 + тема (topic) 5 в группе с темами."""
+    m = re.fullmatch(r"(-?\d+|@\w+):(\d+)", chat)
+    return {"chat_id": m.group(1), "message_thread_id": m.group(2)} if m else {"chat_id": chat}
+
+
 def send_text(chats, text):
     if len(text) > 4000:
         text = text[:3990] + "…"
     for chat in chats:
-        tg("sendMessage", {"chat_id": chat, "text": text, "parse_mode": "HTML",
+        tg("sendMessage", {**target(chat), "text": text, "parse_mode": "HTML",
                            "disable_web_page_preview": "true"})
 
 
@@ -267,7 +280,7 @@ def send_post(chats, text, image=None):
     """С картинкой — sendPhoto (подпись до 1024 знаков); если не вышло — обычный текст."""
     for chat in chats:
         if image and SEND_IMAGES and len(text) <= 1024:
-            r = tg("sendPhoto", {"chat_id": chat, "photo": image, "caption": text, "parse_mode": "HTML"})
+            r = tg("sendPhoto", {**target(chat), "photo": image, "caption": text, "parse_mode": "HTML"})
             if r and r.get("ok"):
                 continue
         send_text([chat], text)
@@ -277,44 +290,80 @@ def send(text):  # служебные сообщения — в личку
     send_text(PERSONAL, text)
 
 
-def ask_ai(system, user, max_tokens=4000):
-    """Gemini (бесплатно), если задан GEMINI_API_KEY, иначе Claude."""
-    if GEMINI_KEY:
-        name = "Gemini"
+_gemini_state = {"model": 0, "thinking": True}
+
+
+def ask_gemini(system, user, max_tokens, as_json):
+    for _ in range(len(GEMINI_MODELS) * 2):
+        if _gemini_state["model"] >= len(GEMINI_MODELS):
+            _gemini_state["model"] = 0
+            return None
+        model = GEMINI_MODELS[_gemini_state["model"]]
+        cfg = {"maxOutputTokens": max_tokens, "temperature": 0.2}
+        if as_json:
+            cfg["responseMimeType"] = "application/json"
+        if _gemini_state["thinking"]:
+            cfg["thinkingConfig"] = {"thinkingBudget": 0}  # без «размышлений»: они съедают лимит ответа
         body = json.dumps({
             "systemInstruction": {"parts": [{"text": system}]},
             "contents": [{"role": "user", "parts": [{"text": user}]}],
-            "generationConfig": {"maxOutputTokens": max_tokens, "temperature": 0.2},
+            "generationConfig": cfg,
         }).encode()
         req = urllib.request.Request(
-            f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent",
+            f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
             data=body, headers={"x-goog-api-key": GEMINI_KEY, "content-type": "application/json"})
-        extract = lambda resp: "".join(
-            p.get("text", "") for c in resp.get("candidates", [])[:1]
-            for p in c.get("content", {}).get("parts", []))
-    else:
-        name = "Claude"
-        body = json.dumps({
-            "model": MODEL, "max_tokens": max_tokens, "system": system,
-            "messages": [{"role": "user", "content": user}],
-        }).encode()
-        req = urllib.request.Request("https://api.anthropic.com/v1/messages", data=body, headers={
-            "x-api-key": API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"})
-        extract = lambda resp: "".join(b.get("text", "") for b in resp.get("content", []))
+        try:
+            with urllib.request.urlopen(req, timeout=120) as r:
+                resp = json.load(r)
+            cand = (resp.get("candidates") or [{}])[0]
+            text = "".join(p.get("text", "") for p in cand.get("content", {}).get("parts", []))
+            if cand.get("finishReason") == "MAX_TOKENS":
+                print(f"Gemini ({model}): ответ обрезан по длине", file=sys.stderr)
+            return text
+        except urllib.error.HTTPError as e:
+            msg = e.read().decode("utf-8", "ignore")
+            print(f"Gemini ({model}) error {e.code}: {msg[:250]}", file=sys.stderr)
+            if e.code == 400 and _gemini_state["thinking"] and "think" in msg.lower():
+                _gemini_state["thinking"] = False
+                continue
+            if e.code in (404, 429) or (e.code == 400 and "model" in msg.lower()):
+                _gemini_state["model"] += 1  # следующая модель
+                continue
+            if e.code in (500, 502, 503, 504):
+                time.sleep(5)
+                continue
+            return None
+        except Exception as e:
+            print(f"Gemini ({model}) error: {e}", file=sys.stderr)
+            return None
+    return None
+
+
+def ask_claude(system, user, max_tokens):
+    body = json.dumps({"model": MODEL, "max_tokens": max_tokens, "system": system,
+                       "messages": [{"role": "user", "content": user}]}).encode()
+    req = urllib.request.Request("https://api.anthropic.com/v1/messages", data=body, headers={
+        "x-api-key": API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"})
     for attempt in range(3):
         try:
             with urllib.request.urlopen(req, timeout=120) as r:
-                return extract(json.load(r))
+                return "".join(b.get("text", "") for b in json.load(r).get("content", []))
         except urllib.error.HTTPError as e:
-            msg = e.read().decode("utf-8", "ignore")
-            print(f"{name} error {e.code}: {msg[:300]}", file=sys.stderr)
+            print(f"Claude error {e.code}: {e.read().decode('utf-8', 'ignore')[:250]}", file=sys.stderr)
             if e.code in (429, 500, 502, 503, 529) and attempt < 2:
                 time.sleep(10 * (attempt + 1))
                 continue
             return None
         except Exception as e:
-            print(f"{name} error: {e}", file=sys.stderr)
+            print(f"Claude error: {e}", file=sys.stderr)
             return None
+
+
+def ask_ai(system, user, max_tokens=4000, as_json=False):
+    """Gemini (бесплатно), если задан GEMINI_API_KEY, иначе Claude."""
+    if GEMINI_KEY:
+        return ask_gemini(system, user, max_tokens, as_json)
+    return ask_claude(system, user, max_tokens)
 
 
 # ───────────────────────── разбор лент ─────────────────────────
@@ -521,9 +570,12 @@ def score_chunk(items, recent_titles):
     recent = "\n".join(f"- {t}" for t in recent_titles[-40:]) or "(пусто)"
     user = f"Недавно отправлено:\n{recent}\n\nНовые новости:\n\n" + "\n\n".join(lines)
     system = SYSTEM_PROMPT.replace("{watchlist}", ", ".join(WATCHLIST))
-    result = extract_json(ask_ai(system, user, max_tokens=320 * len(items) + 500))
+    result = extract_json(ask_ai(system, user, max_tokens=400 * len(items) + 800, as_json=True))
     if not isinstance(result, list):
-        print("ИИ не вернул JSON — использую ключевые слова", file=sys.stderr)
+        if len(items) > 1:  # пробуем половинками
+            mid = len(items) // 2
+            return score_chunk(items[:mid], recent_titles) + score_chunk(items[mid:], recent_titles)
+        print(f"ИИ не оценил: {items[0]['title'][:60]}", file=sys.stderr)
         return items
     for r in result:
         try:
@@ -777,7 +829,7 @@ def check_news(state, now):
 
     fresh.sort(key=lambda x: x["ts"] or 0)
     fresh = fresh[-MAX_PER_CYCLE:]
-    if not fresh:
+    if not fresh and not state.get("pending"):
         print(f"{now:%H:%M} новых нет")
         return
 
@@ -797,10 +849,26 @@ def check_news(state, now):
             continue
         unique.append(it)
 
+    # новости, которые ИИ не смог оценить в прошлый раз, — ещё одна попытка
+    pending = state.pop("pending", [])
+    unique = pending + unique
     scored = score_items(unique, recent_titles)
     to_send = []
     quiet = in_quiet(now)
     for it in scored:
+        if AI_ON and not it.get("ai"):
+            it["tries"] = it.get("tries", 0) + 1
+            if it["tries"] < MAX_AI_RETRIES:
+                state.setdefault("pending", []).append(
+                    {k: it[k] for k in ("id", "title", "link", "desc", "image", "ts", "source", "region", "tries")})
+                log.append(("   ", "ждёт ИИ (повтор)", it))
+                continue
+            # ИИ так и не ответил — не публикуем «сырой» пост, только в дайджест
+            state["queue"].append({"title": it["title"], "link": it["link"], "score": it["score"],
+                                   "summary": "", "watch": it["watch"], "ts": it["ts"],
+                                   "source": it["source"], "region": it["region"]})
+            log.append(("   ", "без ИИ → дайджест", it))
+            continue
         state["recent"].append({"title": it["title"], "ts": now_ts})
         if it.get("title_ru"):
             state["recent"].append({"title": it["title_ru"], "ts": now_ts})
@@ -836,8 +904,10 @@ def check_news(state, now):
     for sc, what, it in sorted(log, key=lambda x: x[0], reverse=True):
         print(f"{sc}  {what:<20} [{it['source']}] {(it.get('title_ru') or it['title'])[:85]}")
     print("─" * 70)
-    if scored and not all(x.get("ai") for x in scored):
-        print("⚠️ Часть новостей оценена по ключевым словам (ИИ не ответил или нет ключа)")
+    if AI_ON and scored and not all(x.get("ai") for x in scored):
+        print("⚠️ ИИ ответил не на все новости — они попробуются ещё раз (см. ошибки Gemini выше)")
+    elif not AI_ON:
+        print("⚠️ Ключ ИИ не задан — оценка по ключевым словам")
     by_reg = {r: sum(1 for it in to_send if it["region"] == r) for r in REGIONS}
     print(f"{now:%H:%M} новых {len(fresh) + len(junk)}, отправлено "
           + ", ".join(f"{r} {n}" for r, n in by_reg.items()))
