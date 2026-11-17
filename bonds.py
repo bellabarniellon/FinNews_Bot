@@ -20,6 +20,7 @@ Vitis Bonds Bot — облигации KASE и AIX → тема «Bonds Alert».
 """
 import html
 import io
+import math
 import json
 import os
 import re
@@ -202,6 +203,31 @@ def load_kase(now):
     return corp, gov, muni, ust_kase
 
 
+KASE_GOV_PAGE = "https://kase.kz/ru/markets/government-securities"
+
+
+def load_kase_curve():
+    """Официальная спот-кривая ГЦБ KASE со страницы ГЦБ (лежит в HTML) →
+    [(дата, [сроки, лет], [доходность, % — непрерывное начисление])], от старой к новой."""
+    page = fetch(KASE_GOV_PAGE, timeout=40).decode("utf-8", "ignore")
+    i = page.find('"spot":[')
+    if i < 0:
+        i = page.find('&q;spot&q;:[')  # на случай экранированного JSON
+        if i < 0:
+            raise RuntimeError("на странице ГЦБ не найден блок spot")
+        page = page.replace("&q;", '"')
+        i = page.find('"spot":[')
+    data, _ = json.JSONDecoder().raw_decode(page[i + len('"spot":'):])
+    out = []
+    for d in data:
+        pts = sorted((float(p["x"]), float(p["y"])) for p in d.get("dataset", []) if p.get("x") is not None)
+        if len(pts) > 10:
+            out.append((d.get("calc_date", ""), [p[0] for p in pts], [p[1] for p in pts]))
+    if not out:
+        raise RuntimeError("в блоке spot нет точек")
+    return sorted(out, key=lambda t: t[0])
+
+
 def load_ust(now):
     """Официальная кривая UST (treasury.gov) → [(лет, доходность)]."""
     tenors = {"1 Mo": 1/12, "2 Mo": 2/12, "3 Mo": 0.25, "4 Mo": 1/3, "6 Mo": 0.5, "1 Yr": 1, "2 Yr": 2,
@@ -234,7 +260,7 @@ def fit_ns(years, yields):
     import numpy as np
     m, y = np.asarray(years, float), np.asarray(yields, float)
     best = None
-    for tau in np.concatenate([np.linspace(0.1, 1, 19), np.linspace(1.1, 10, 90)]):
+    for tau in np.linspace(0.076, 5, 200):  # диапазон τ как в методике KASE — без «загиба» на длинном конце
         x = m / tau
         f = (1 - np.exp(-x)) / x
         X = np.column_stack([np.ones_like(m), f, f - np.exp(-x)])
@@ -274,7 +300,28 @@ def build_report(now, prev):
     if len(gov_pts) < 5:
         raise RuntimeError(f"мало ГЦБ с актуальной доходностью ({len(gov_pts)}) — кривую не построить")
     kzt, kzt_rmse, kzt_n = robust_fit(gov_pts)
-    curve = lambda m: float(ns_yield([max(m, 0.02)], *kzt)[0])
+    own = lambda m: float(ns_yield([max(m, 0.02)], *kzt)[0])
+
+    # Основная кривая — официальная KASE (спот, непрерывное начисление) → переводим в годовую
+    # доходность exp(z)−1, чтобы сравнивать с доходностями облигаций (они годовые)
+    official = None
+    try:
+        days = load_kase_curve()
+        d, xs, ys = days[-1]
+        prev_d = days[-2] if len(days) > 1 else None
+        cont = lambda m, xs=xs, ys=ys: float(np.interp(m, xs, ys))
+        official = {"date": d, "cont": cont,
+                    "prev_date": prev_d[0] if prev_d else None,
+                    "prev_cont": (lambda m, xs=prev_d[1], ys=prev_d[2]: float(np.interp(m, xs, ys))) if prev_d else None}
+        print(f"Официальная кривая KASE: {d}, точек {len(xs)}; 1Y={cont(1):.2f}% (непр.)")
+    except Exception as e:
+        print(f"Официальная кривая KASE недоступна ({e}) — строю свою по сделкам", file=sys.stderr)
+    to_annual = lambda z: (math.exp(z / 100) - 1) * 100
+    if official:
+        curve = lambda m: to_annual(official["cont"](m))
+        prev_curve = (lambda m: to_annual(official["prev_cont"](m))) if official["prev_cont"] else None
+    else:
+        curve, prev_curve = own, None
 
     ust_pts, ust_date = load_ust(now)
     if not ust_pts:  # запасной вариант — UST, торгующиеся на KASE
@@ -321,6 +368,7 @@ def build_report(now, prev):
     anomalies = [b for b in universe if b["flag"] and b["flag"] != "до погашения < 3 мес."]
     no_deals = [b for b in universe if not b["fresh"]]
     return {"kzt": kzt, "kzt_rmse": kzt_rmse, "kzt_n": kzt_n, "usd": usd, "ust_date": ust_date,
+            "curve": curve, "prev_curve": prev_curve, "official": official,
             "ust_pts": ust_pts or [], "gov": gov_pts, "points": {t: curve(t) for t in TENORS},
             "kzt_live": kzt_live, "usd_live": usd_live, "no_deals": no_deals, "anomalies": anomalies, "all": universe, "gov_all": gov,
             "kzt_sectors": sector_table(kzt_live), "usd_sectors": sector_table(usd_live), "prev": prev}
@@ -335,21 +383,24 @@ def draw_chart(rep, date_str):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-    panels = [("KZT", rep["kzt"], rep["gov"], rep["kzt_live"], "Кривая ГЦБ РК")]
+    kzt_label = ("Кривая ГЦБ KASE (официальная)" if rep["official"]
+                 else "Кривая ГЦБ (по сделкам)")
+    panels = [("KZT", rep["curve"], rep["gov"], rep["kzt_live"], kzt_label)]
     if rep["usd"] and rep["usd_live"]:
-        panels.append(("USD", rep["usd"], rep["ust_pts"], rep["usd_live"], "Кривая UST"))
+        panels.append(("USD", lambda m: float(ns_yield([m], *rep["usd"])[0]), rep["ust_pts"], rep["usd_live"], "Кривая UST"))
     fig, axes = plt.subplots(1, len(panels), figsize=(7.2 * len(panels), 6), dpi=150, squeeze=False)
     fig.patch.set_facecolor("#0f1720")
-    for ax, (cur, params, base_pts, bonds, label) in zip(axes[0], panels):
+    for ax, (cur, fn, base_pts, bonds, label) in zip(axes[0], panels):
         ax.set_facecolor("#0f1720")
         maxm = min(15, max([p[0] for p in base_pts if p[0] <= 15] + [b["years"] for b in bonds] + [5]) + 0.5)
-        xs = np.linspace(0.05, maxm, 300)
-        ax.plot(xs, ns_yield(xs, *params), color="#ffffff", lw=2.4, label=label, zorder=3)
-        if cur == "KZT" and rep["prev"].get("params"):
-            ax.plot(xs, ns_yield(xs, *rep["prev"]["params"]), color="#8a99a8", lw=1.2, ls="--",
-                    label=f"Вчера ({rep['prev'].get('date', '')})", zorder=2)
+        last = maxm if (cur == "KZT" and rep["official"]) else min(maxm, max(p[0] for p in base_pts) + 1)
+        xs = np.linspace(0.05, last, 300)
+        ax.plot(xs, [fn(x) for x in xs], color="#ffffff", lw=2.4, label=label, zorder=3)
+        if cur == "KZT" and rep["prev_curve"]:
+            ax.plot(xs, [rep["prev_curve"](x) for x in xs], color="#8a99a8", lw=1.2, ls="--",
+                    label=f"Предыдущий день ({'.'.join(reversed(rep['official']['prev_date'].split('-')))})", zorder=2)
         ax.scatter([p[0] for p in base_pts if p[0] <= maxm], [p[1] for p in base_pts if p[0] <= maxm],
-                   s=16, color="#cfd8e3", alpha=0.6, label="ГЦБ" if cur == "KZT" else "UST", zorder=4)
+                   s=16, color="#cfd8e3", alpha=0.6, label="Сделки ГЦБ" if cur == "KZT" else "UST", zorder=4)
         for s, color in SECTOR_COLORS.items():
             pts = [b for b in bonds if b["sector"] == s and b["years"] <= maxm]
             if pts:
@@ -370,8 +421,10 @@ def draw_chart(rep, date_str):
         for t in leg.get_texts():
             t.set_color("#e6edf3")
     fig.suptitle(f"Облигации KASE · {date_str}", color="#ffffff", fontsize=13, x=0.01, ha="left")
-    fig.text(0.01, 0.01, "Источник: KASE (бумаги с ценой не старше 30 дней); кривые — Nelson-Siegel; "
-             f"UST — {rep['ust_date'] or '—'}", color="#6d7f8f", fontsize=7.5)
+    kz_src = ("кривая ГЦБ — официальная KASE, переведена в годовую доходность" if rep["official"]
+              else "кривая ГЦБ — Nelson-Siegel по сделкам")
+    fig.text(0.01, 0.01, f"Источник: KASE (бумаги с ценой не старше 30 дней); {kz_src}; "
+             f"UST — treasury.gov {rep['ust_date'] or '—'}", color="#6d7f8f", fontsize=7.5)
     buf = io.BytesIO()
     fig.tight_layout(rect=(0, 0.03, 1, 0.95))
     fig.savefig(buf, format="png", facecolor=fig.get_facecolor())
@@ -435,17 +488,30 @@ def fmt_bp(x):
 
 
 def report_texts(rep, date_str, coupons):
-    prev = rep["prev"].get("points", {})
+    off = rep["official"]
     lines = []
-    for t in TENORS:
-        y = rep["points"][t]
-        p = prev.get(str(t))
-        d = f"{(y - p) * 100:+.0f}" if p is not None else "  —"
-        label = f"{t:g}Y" if t >= 1 else f"{int(t * 12)}M"
-        lines.append(f"{label:<5}{fmt_pct(y):>8}{d:>7}")
+    if off:
+        for t in TENORS:
+            z = off["cont"](t)
+            d = f"{round((z - off['prev_cont'](t)) * 100):+d}" if off["prev_cont"] else " —"
+            label = f"{t:g}Y" if t >= 1 else f"{int(t * 12)}M"
+            lines.append(f"{label:<4}{fmt_pct(z):>8}{fmt_pct(rep['points'][t]):>9}{d:>5}")
+        table = "<pre>Срок   KASE   Годовая  Δ,бп\n" + "\n".join(lines) + "</pre>\n"
+        dd = "-".join(reversed(off["date"].split("-"))).replace("-", ".")
+        head = (f"<b>Кривая ГЦБ KASE на {esc(dd)}</b>\n<i>«KASE» — как на сайте (спот, непрерывное "
+                "начисление); «Годовая» — та же ставка в годовой доходности, к ней считаются спреды</i>\n")
+    else:
+        prev = rep["prev"].get("points", {})
+        for t in TENORS:
+            y = rep["points"][t]
+            p = prev.get(str(t))
+            d = f"{(y - p) * 100:+.0f}" if p is not None else "  —"
+            label = f"{t:g}Y" if t >= 1 else f"{int(t * 12)}M"
+            lines.append(f"{label:<5}{fmt_pct(y):>8}{d:>7}")
+        table = "<pre>Срок  Доходн.  Δ,бп\n" + "\n".join(lines) + "</pre>\n"
+        head = "<b>Кривая ГЦБ (по сделкам — официальная KASE недоступна)</b>\n"
     slope = (rep["points"][10] - rep["points"][1]) * 100
-    caption = (f"📉 <b>Облигации KASE · {date_str}</b>\n\n<b>Кривая ГЦБ (KZT)</b>\n"
-               f"<pre>Срок  Доходн.  Δ,бп\n" + "\n".join(lines) + "</pre>\n"
+    caption = (f"📉 <b>Облигации KASE · {date_str}</b>\n\n" + head + table +
                f"Наклон 10Y–1Y: <b>{fmt_bp(slope)}</b> "
                f"({'нормальная' if slope > 25 else 'инвертированная' if slope < -25 else 'плоская'})")
 
@@ -484,9 +550,10 @@ def report_texts(rep, date_str, coupons):
             f"{esc(b['ticker'])} ({fmt_pct(b['yield'])})" for b in rep["anomalies"][:8])
             + ("…" if len(rep["anomalies"]) > 8 else "") + "\n<i>Скорее всего валютная индексация или случайная "
             "цена сделки. В Excel помечены в колонке «Примечание».</i>")
-    parts.append(f"<i>Кривая ГЦБ по {rep['kzt_n']} выпускам со сделками за {FRESH_DAYS_GOV} дней, "
-                 f"точность ±{rep['kzt_rmse'] * 100:.0f} бп. В средних — бумаги с ценой не старше "
-                 f"{FRESH_DAYS_CORP} дней и сроком от 3 мес.</i>")
+    src = ("G-спред — к официальной кривой ГЦБ KASE (в годовой доходности)" if rep["official"] else
+           f"Кривая ГЦБ по {rep['kzt_n']} выпускам со сделками за {FRESH_DAYS_GOV} дней, "
+           f"точность ±{rep['kzt_rmse'] * 100:.0f} бп")
+    parts.append(f"<i>{src}. В средних — бумаги с ценой не старше {FRESH_DAYS_CORP} дней и сроком от 3 мес.</i>")
     return caption, "\n\n".join(parts)
 
 
@@ -516,7 +583,7 @@ def send_report(state, now):
     send_text(CHATS, text)
     send_document(CHATS, build_excel(rep, date_str), f"KASE_bonds_{now:%Y-%m-%d}.xlsx",
                   f"📎 Все облигации KASE на {date_str}: с ценой, без сделок, USD, ГЦБ")
-    state["curve"] = {"date": f"{now:%d.%m}", "params": list(rep["kzt"]),
+    state["curve"] = {"date": f"{now:%d.%m}",
                       "points": {str(t): v for t, v in rep["points"].items()}}
     state["coupons"] = []
     print(f"Отчёт отправлен: KZT с ценой {len(rep['kzt_live'])}, USD {len(rep['usd_live'])}, "
