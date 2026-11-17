@@ -239,8 +239,12 @@ def load_ust(now):
             row = [c.strip().strip('"') for c in text[1].split(",")]  # первая строка — последняя дата
             pts = [(tenors[h], float(v)) for h, v in zip(head, row) if h in tenors and v]
             if len(pts) >= 5:
-                print(f"UST: {row[0]}, {len(pts)} сроков")
-                return pts, row[0]
+                try:
+                    d = datetime.strptime(row[0], "%m/%d/%Y").strftime("%d.%m.%Y")
+                except ValueError:
+                    d = row[0]
+                print(f"UST: {d}, {len(pts)} сроков")
+                return pts, d
         except Exception as e:
             print(f"UST {y} недоступна: {e}", file=sys.stderr)
     return None, None
