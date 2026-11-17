@@ -2,8 +2,8 @@ name: news-bot
 
 on:
   schedule:
-    - cron: "*/10 * * * *"   # каждые 10 минут (GitHub иногда запускает с задержкой)
-  workflow_dispatch:          # кнопка ручного запуска
+    - cron: "*/30 * * * *"   # запуск каждые ~30 мин; внутри бот сам проверяет новости каждые 5 мин
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -15,20 +15,28 @@ concurrency:
 jobs:
   run:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
       - name: Check news
-        run: python bot.py --once
+        run: python bot.py --minutes 45
         env:
           TG_TOKEN: ${{ secrets.TG_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-          ONLY_KEYWORDS: ${{ vars.ONLY_KEYWORDS }}
+          TG_CHAT_KZ: ${{ secrets.TG_CHAT_KZ }}
+          TG_CHAT_KR: ${{ secrets.TG_CHAT_KR }}
+          TG_CHAT_US: ${{ secrets.TG_CHAT_US }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          MIN_SCORE: ${{ vars.MIN_SCORE || '3' }}
+          INTERVAL_SEC: "300"
       - name: Save state
+        if: always()
         run: |
           git config user.name "news-bot"
           git config user.email "news-bot@users.noreply.github.com"
           git add seen.json
-          git diff --cached --quiet || (git commit -m "update seen" && git push)
+          git diff --cached --quiet || (git commit -m "update seen" && git pull --rebase && git push)
