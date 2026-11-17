@@ -1,0 +1,47 @@
+name: bonds-bot
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"   # алерты каждые ~30 мин; кривая — по будням после 18:30 Алматы
+  workflow_dispatch:
+    inputs:
+      report:
+        description: "Отправить отчёт по кривой прямо сейчас"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: bonds-bot
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install packages
+        run: pip install --quiet numpy matplotlib openpyxl
+      - name: Check bonds
+        run: python bonds.py --once ${{ inputs.report && '--report' || '' }}
+        env:
+          TG_TOKEN: ${{ secrets.TG_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          TG_CHAT_BONDS: ${{ secrets.TG_CHAT_BONDS }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      - name: Save state
+        if: always()
+        run: |
+          git config user.name "bonds-bot"
+          git config user.email "bonds-bot@users.noreply.github.com"
+          git add bonds_state.json
+          git diff --cached --quiet && exit 0
+          git commit -m "update bonds state"
+          for i in 1 2 3; do git pull --rebase && git push && break; sleep 5; done
