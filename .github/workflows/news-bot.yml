@@ -49,6 +49,7 @@ jobs:
           TG_CHAT_MACRO: ${{ secrets.TG_CHAT_MACRO }}
           TG_CHAT_CRYPTO: ${{ secrets.TG_CHAT_CRYPTO }}
           TG_CHAT_RADAR: ${{ secrets.TG_CHAT_RADAR }}
+          TG_CHAT_OPINION: ${{ secrets.TG_CHAT_OPINION }}
           DRY_CRYPTO: ${{ inputs.dry_run && '1' || '' }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
