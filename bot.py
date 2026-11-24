@@ -138,7 +138,7 @@ def gnews(query, lang="en", country="US"):
 # Фильтры: "must" — в заголовке/описании должно встретиться; "url" — в ссылке должно встретиться.
 KOREA_RE = r"korea|kospi|kosdaq|samsung|hynix|hyundai|\bkia\b|\blg\b|posco|\bwon\b|seoul|naver|kakao"
 KZ_RE = r"kazakh|казахстан|тенге|tenge|kaspi|kazatomprom|казатомпром|kazmunay|halyk|astana|tengiz|kashagan|\bcpc\b|ктк"
-GEO_RE = (r"\bwar\b|warfare|strike|missile|drone|sanction|ceasefire|truce|peace (talks|deal|plan)|troops|invasion|"
+GEO_RE = (r"\bwars?\b|warship|warfare|iraq|syria|yemen|saudi|strike|missile|drone|sanction|ceasefire|truce|peace (talks|deal|plan)|troops|invasion|"
           r"invade|nuclear|tariff|trade (war|deal)|export control|embargo|blockade|coup|martial law|"
           r"election|summit|opec|iran|ukrain|russia|kremlin|israel|gaza|hezbollah|houthi|red sea|hormuz|"
           r"taiwan|north korea|pyongyang|nato|\bg7\b|\bg20\b|санкци|войн|перемири|удар")
@@ -172,9 +172,6 @@ FEEDS = [
               r"hyundai|\blg\b|\bsk\b|posco|earnings|profit|sales|invest|inflation|gdp|tariff|bok\b"}),
     ("Korea Herald", "KR", [gnews("site:koreaherald.com (business OR economy OR market) when:1d")]),
     ("KED Global", "KR", [gnews("site:kedglobal.com when:1d")]),
-    ("JoongAng Daily", "KR", [gnews("site:koreajoongangdaily.joins.com when:1d")],
-     {"must": r"econom|market|stock|share|kospi|won\b|export|chip|semiconductor|samsung|hynix|hyundai|earnings|"
-              r"profit|invest|inflation|gdp|tariff|bank"}),
     ("BusinessKorea", "KR", [gnews("site:businesskorea.co.kr when:1d")]),
     ("Reuters Korea", "KR", [gnews("site:reuters.com (Korea OR KOSPI OR Samsung OR Hynix OR Hyundai) when:1d")],
      {"must": KOREA_RE}),
@@ -193,13 +190,12 @@ FEEDS = [
     # ─── 🌍 Macro / геополитика ───
     ("Reuters World", "MACRO", [gnews("site:reuters.com (war OR sanctions OR ceasefire OR missile OR tariffs OR "
                                       "Iran OR Ukraine OR Russia OR Taiwan OR OPEC) when:1d")], {"must": GEO_RE}),
-    ("AP", "MACRO", [gnews("site:apnews.com (war OR sanctions OR ceasefire OR Iran OR Ukraine OR Russia OR "
-                           "Taiwan OR tariffs) when:1d")], {"must": GEO_RE}),
     ("BBC World", "MACRO", ["https://feeds.bbci.co.uk/news/world/rss.xml"], {"must": GEO_RE}),
     ("Al Jazeera", "MACRO", ["https://www.aljazeera.com/xml/rss/all.xml"], {"must": GEO_RE}),
     ("OFAC", "MACRO", [gnews("(site:home.treasury.gov OR site:ofac.treasury.gov) sanctions when:2d")]),
     ("EU Council", "MACRO", [gnews("site:consilium.europa.eu sanctions when:2d")]),
 ]
+# AP и JoongAng через Google News отдают только страницы-рубрики, а не новости — убраны.
 # Убраны как шум: Yahoo Finance (~650 записей в сутки: «цена акции онлайн», penny stocks, графики),
 # MarketWatch (личные финансы и мнения), The Economist (эссе, а не новости), SBS Biz (шортсы),
 # общий поток Investing (сделки инсайдеров) и дубли тех же сайтов через Google News.
@@ -273,7 +269,7 @@ SYSTEM_PROMPT = """Ты — редактор новостной ленты дл�
 санкционные риски для Казахстана. Проекты и займы небольших компаний (меньше ~50 млрд ₸), \
 планы «построим к 2027», акиматы и регионы, льготные кредиты, биографии, криминал, назначения \
 ниже министра — 1–2.
-   KR: 4+ — Банк Кореи, экспорт/ВВП/инфляция, вона, отчёты и крупные решения Samsung, SK Hynix, \
+   KR: 4+ — Банк Кореи, фактические данные по экспорту/ВВП/инфляции (прогнозы банков и ведомств — 3), вона, отчёты и крупные решения Samsung, SK Hynix, \
 Hyundai и других тяжеловесов KOSPI, чипы, потоки иностранцев, реформы рынка (Value-up, налоги). \
 Личные дела владельцев чеболей — 3 и только если затрагивают контроль или пакет акций. \
 Общество, спорт, внутренняя политика без влияния на рынок — 1.
@@ -292,7 +288,10 @@ Hyundai и других тяжеловесов KOSPI, чипы, потоки и�
 - "tags": 1–3 тега латиницей или кириллицей без пробелов (тикеры, компании, темы: "Samsung", "ФРС", "нефть")
 - "watch": названия из watchlist, которые ПРЯМО упомянуты в новости, массивом; \
 косвенная связь (тот же сектор, «может повлиять») — НЕ считается; иначе []
-- "dup": true, если это та же история, что в «недавно отправлено» или выше в этом списке
+- "dup": true, если это ТО ЖЕ СОБЫТИЕ, что в «недавно отправлено» или выше в этом списке, — даже если \
+издание другое и слова другие (напр. «KOSPI превысил 5000» и «Kospi подскочил выше 5000 на ралли чипов» — \
+одно событие; пересказ, реакция рынка и «что это значит» про уже отправленное событие — тоже dup). \
+Из нескольких версий одного события оставь одну — самую полную, остальным ставь dup
 
 Watchlist: {watchlist}
 
@@ -672,20 +671,26 @@ def is_breaking(it):
     return bool(BREAK_EVENT.search(text) and BREAK_ENTITY.search(text))
 
 
-def plausible(it, r):
-    """Ответ ИИ действительно про эту новость? Защита от перепутанных номеров (чужой текст → чужая ссылка)."""
+def _overlap(it, out):
+    """Сколько слов ответа ИИ (латиница, числа, русские основы) встречается в исходной новости."""
     src = f"{it['title']} {it['desc']}".lower().replace(",", ".")
-    title_ru = str(r.get("title_ru") or "").lower().replace(",", ".")
-    if not title_ru:
+    toks = set(re.findall(r"[a-z]{3,}|\d+(?:\.\d+)?", out))
+    stems = {w[:5] for w in re.findall(r"[а-яё]{5,}", out)}
+    return sum(t in src for t in toks) + len(stems & {w[:5] for w in re.findall(r"[а-яё]{5,}", src)})
+
+
+def plausible(it, r, others=()):
+    """Ответ ИИ действительно про эту новость? Вторая защита от чужих ссылок (первая — коды вместо номеров).
+    Бракуем, только если с этой новостью общих слов нет, а с другой из той же пачки — явно есть:
+    у перевода с английского общих слов с оригиналом может не быть совсем, это не ошибка."""
+    if not r.get("title_ru"):
         return True
-    tokens = set(re.findall(r"[a-z]{3,}|\d+(?:\.\d+)?", title_ru))
-    if tokens and not any(t in src for t in tokens):
-        return False
-    stems = {w[:5] for w in re.findall(r"[а-яё]{5,}", src)}
-    if len(stems) >= 3:  # русский источник: должны совпасть хоть какие-то слова
-        out = f"{title_ru} {str(r.get('summary') or '').lower()}"
-        return bool(stems & {w[:5] for w in re.findall(r"[а-яё]{5,}", out)})
-    return True
+    out = f"{r.get('title_ru')} {r.get('summary') or ''}".lower().replace(",", ".")
+    if _overlap(it, out) > 0:
+        return True
+    if len({w[:5] for w in re.findall(r"[а-яё]{5,}", f"{it['title']} {it['desc']}".lower())}) >= 3:
+        return False   # русский источник и ни одного общего слова
+    return not any(_overlap(o, out) >= 2 for o in others if o is not it)
 
 
 def score_chunk(items, recent_titles):
@@ -718,7 +723,7 @@ def score_chunk(items, recent_titles):
         it = by_id.get(str(r.get("i", "")).strip("[] "))
         if it is None:
             continue
-        if not plausible(it, r):
+        if not plausible(it, r, items):
             print(f"ИИ перепутал новости — «{str(r.get('title_ru'))[:50]}» не про «{it['title'][:50]}»; повтор",
                   file=sys.stderr)
             continue
@@ -777,7 +782,7 @@ def format_post(it):
         parts.append(f"📈 <i>Влияние:</i> <b>{esc(it['impact'])}</b>")
     when = " · " + local(it["ts"]).strftime("%d.%m %H:%M") if it.get("ts") else ""
     src = f'🔗 <a href="{html.escape(it["link"])}">{esc(it["source"])}</a><i>{when}</i>'
-    tags = " ".join(filter(None, (hashtag(t) for t in it.get("tags", []) + it["watch"])))
+    tags = " ".join(dict.fromkeys(filter(None, (hashtag(t) for t in it.get("tags", []) + it["watch"]))))
     parts.append(src + (f"\n{tags}" if tags else ""))
     text = "\n\n".join(parts)
     if len(text) > 1024 and it.get("summary"):  # влезть в подпись к фото
@@ -944,7 +949,15 @@ def save_state(state):
 # ───────────────────────── основной цикл ─────────────────────────
 
 _cycle = {"n": 0}
-SAMPLE = int(sys.argv[sys.argv.index("--sample") + 1]) if "--sample" in sys.argv else 0
+def _sample_arg():
+    """--sample N для bot.py; у bonds.py флаг --sample идёт без числа."""
+    if "--sample" not in sys.argv:
+        return 0
+    nxt = sys.argv[sys.argv.index("--sample") + 1:][:1]
+    return int(nxt[0]) if nxt and nxt[0].isdigit() else 5
+
+
+SAMPLE = _sample_arg()
 
 
 def load_source(urls, with_gnews=True):
@@ -1104,7 +1117,8 @@ def check_news(state, now):
     for i in range(0, len(todo), AI_CHUNK):
         chunk = score_chunk(todo[i:i + AI_CHUNK], recent_titles)
         to_send = [it for it in chunk if route(it)]
-        recent_titles += [it["title"] for it in chunk if it.get("ai")]
+        recent_titles += [t for it in chunk if it.get("ai") and not it["dup"]
+                          for t in (it["title"], it.get("title_ru")) if t]
         if SEND_IMAGES and to_send:
             with ThreadPoolExecutor(8) as ex:
                 to_send = list(ex.map(add_image, to_send))
