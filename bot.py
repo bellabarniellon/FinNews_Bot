@@ -16,7 +16,7 @@ Vitis News Bot v4 — новости по каналам: 🇰🇿 Vitis KZ · �
 
 Секреты:
   TG_TOKEN                     — токен бота (обязательно)
-  TG_CHAT_KZ / TG_CHAT_KR / TG_CHAT_US / TG_CHAT_MACRO — каналы (@имя или -100...; можно несколько через запятую)
+  TG_CHAT_KZ / TG_CHAT_KR / TG_CHAT_US / TG_CHAT_MACRO / TG_CHAT_CRYPTO / TG_CHAT_RADAR — каналы (@имя или -100...; можно несколько через запятую)
                                  или темы одной группы: -100XXXXXXXXXX:номер_темы
   TG_CHAT_ID                   — личный чат для служебных сообщений; если канал не задан, его новости идут сюда
   GEMINI_API_KEY               — бесплатный ИИ (или ANTHROPIC_API_KEY — Claude)
@@ -63,14 +63,48 @@ WATCHLIST = {
 }
 
 # С какой оценки присылать сразу — отдельно по каналам (можно переопределить: MIN_SCORE_US=3 и т.п.)
-MIN_SCORE = {"US": 4, "KZ": 4, "KR": 3, "MACRO": 4}
+MIN_SCORE = {"US": 4, "KZ": 4, "KR": 3, "MACRO": 4, "CRYPTO": 4}
 MIN_SCORE = {r: int(os.environ.get(f"MIN_SCORE_{r}") or v) for r, v in MIN_SCORE.items()}
 DROP_BELOW = 3                 # ниже — не присылать вообще (и в дайджест тоже)
 # Потолок постов в час на канал (🔴 5/5 проходят всегда); лишнее уходит в дайджест
-MAX_PER_HOUR = {"US": 8, "KR": 8, "KZ": 6, "MACRO": 6}
+MAX_PER_HOUR = {"US": 8, "KR": 8, "KZ": 6, "MACRO": 6, "CRYPTO": 5}
 MAX_AGE_HOURS = 36             # новости старше — не публикуем (старые страницы, всплывшие в лентах)
 QUIET_FROM, QUIET_TO = 23, 8   # тихие часы по Алматы
-DIGEST_HOURS = [8, 19]
+DIGEST_HOURS = [9, 19]         # 9:00 — утренняя сводка (котировки + главное), 19:00 — вечерний дайджест
+BRIEF_HOUR = 9
+# 📡 Радар (после утренней сводки US): 1) акции с необычным объёмом на росте, 2) какие отрасли растут.
+# Только цифры, без объяснений и оценок. Выключить: переменная RADAR=0.
+RADAR = os.environ.get("RADAR", "1") != "0"
+RADAR_VOL_X = 3.0            # объём за день минимум в 3 раза выше среднего
+RADAR_MOVE = 4.0             # и цена ВЫРОСЛА минимум на 4% (объём на росте = покупки)
+RADAR_CAP = (1e9, 100e9)     # капитализация от $1 млрд до $100 млрд (без микрокапов и без гигантов)
+# Отрасли — через отраслевые ETF (название, тикер)
+INDUSTRIES = [
+    ("Технологии", "XLK"), ("Финансы", "XLF"), ("Энергетика", "XLE"), ("Здравоохранение", "XLV"),
+    ("Промышленность", "XLI"), ("Потреб. цикличный", "XLY"), ("Потреб. защитный", "XLP"), ("Коммунальные", "XLU"),
+    ("Материалы", "XLB"), ("Недвижимость", "XLRE"), ("Связь и медиа", "XLC"),
+    ("Полупроводники", "SMH"), ("Софт", "IGV"), ("Кибербезопасность", "CIBR"), ("ИИ и роботы", "BOTZ"),
+    ("Дата-центры", "DTCR"), ("Биотех", "XBI"), ("Регион. банки", "KRE"), ("Оборонка", "ITA"),
+    ("Уран", "URA"), ("Атомная энергетика", "NLR"), ("Золотодобытчики", "GDX"), ("Металлы и добыча", "XME"),
+    ("Нефтедобыча", "XOP"), ("Солнечная энергия", "TAN"), ("Литий и батареи", "LIT"), ("Стройка жилья", "XHB"),
+    ("Авиалинии", "JETS"), ("Ритейл", "XRT"), ("Китай: интернет", "KWEB"), ("Крипто-акции", "BITQ"),
+]
+# Запасной список акций для поиска объёмов — используется, только если готовые списки Yahoo не открылись
+RADAR_UNIVERSE = ("NBIS CRWV VRT ANET SMCI DELL CLS CRDO ALAB MRVL MU LITE COHR CIEN APLD IREN CORZ VST CEG GEV TLN "
+                  "OKLO SMR CCJ LEU BE PLTR SNOW DDOG NET CRWD ZS MDB APP RDDT SHOP COIN HOOD MSTR SOFI AFRM PYPL "
+                  "AMAT LRCX KLAC ASML ARM ON MPWR RIVN LCID UBER RKLB ASTS MRNA VRTX BABA PDD JD CVNA DASH ABNB "
+                  "SPOT TTD ROKU DKNG CELH ELF ONON DECK FSLR ENPH NEM FCX AA CLF X DAL UAL CCL RCL").split()
+MEGACAPS = {"NVDA", "AAPL", "MSFT", "GOOGL", "GOOG", "AMZN", "META", "TSLA", "AVGO", "BRK.B", "BRK-B", "JPM",
+            "LLY", "V", "MA", "WMT", "XOM", "ORCL", "NFLX", "COST", "TSM", "AMD", "INTC", "005930.KS", "000660.KS"}
+# Утренняя сводка: что показывать в каждом канале (название, тикер Yahoo Finance)
+BRIEF_QUOTES = {
+    "US": [("S&P 500", "^GSPC"), ("Nasdaq", "^IXIC"), ("Dow Jones", "^DJI"), ("UST 10Y", "^TNX"), ("DXY", "DX-Y.NYB")],
+    "KR": [("KOSPI", "^KS11"), ("KOSDAQ", "^KQ11"), ("USD/KRW", "KRW=X"), ("Samsung", "005930.KS"),
+           ("SK Hynix", "000660.KS")],
+    "KZ": [("USD/KZT", "KZT=X"), ("Brent", "BZ=F"), ("Kaspi ADR", "KSPI")],   # + индекс KASE из новостей биржи
+    "MACRO": [("VIX", "^VIX"), ("Brent", "BZ=F"), ("WTI", "CL=F"), ("Gold", "GC=F"), ("DXY", "DX-Y.NYB"),
+              ("UST 10Y", "^TNX")],
+}
 CALENDAR_REMIND_MIN = 60
 SEND_IMAGES = True
 
@@ -80,7 +114,11 @@ REGIONS = {
     "KR": {"flag": "🇰🇷", "name": "Vitis Korea", "env": "TG_CHAT_KR"},
     "US": {"flag": "🇺🇸", "name": "Vitis US", "env": "TG_CHAT_US"},
     "MACRO": {"flag": "🌍", "name": "Vitis Macro News", "env": "TG_CHAT_MACRO"},
+    "CRYPTO": {"flag": "🪙", "name": "Vitis Crypto", "env": "TG_CHAT_CRYPTO"},
 }
+# Крипто-канал выключен, пока не задан секрет TG_CHAT_CRYPTO: ленты не опрашиваются, лимит ИИ не тратится
+CRYPTO_ON = bool(os.environ.get("TG_CHAT_CRYPTO")) or os.environ.get("DRY_CRYPTO") == "1"
+ACTIVE = [r for r in REGIONS if r != "CRYPTO" or CRYPTO_ON]
 
 # Календарь Forex Factory: страна → канал (глобальная макро идёт в US)
 CALENDAR_COUNTRIES = {"USD": "US", "EUR": "US", "JPY": "US", "CNY": "US"}
@@ -194,7 +232,13 @@ FEEDS = [
     ("Al Jazeera", "MACRO", ["https://www.aljazeera.com/xml/rss/all.xml"], {"must": GEO_RE}),
     ("OFAC", "MACRO", [gnews("(site:home.treasury.gov OR site:ofac.treasury.gov) sanctions when:2d")]),
     ("EU Council", "MACRO", [gnews("site:consilium.europa.eu sanctions when:2d")]),
+    # ─── 🪙 Crypto (только если задан TG_CHAT_CRYPTO) ───
+    ("CoinDesk", "CRYPTO", ["https://www.coindesk.com/arc/outboundfeeds/rss/"]),
+    ("Cointelegraph", "CRYPTO", ["https://cointelegraph.com/rss"]),
+    ("The Block", "CRYPTO", ["https://www.theblock.co/rss.xml"]),
+    ("Decrypt", "CRYPTO", ["https://decrypt.co/feed"]),
 ]
+FEEDS = [f for f in FEEDS if f[1] in ACTIVE]
 # AP и JoongAng через Google News отдают только страницы-рубрики, а не новости — убраны.
 # Убраны как шум: Yahoo Finance (~650 записей в сутки: «цена акции онлайн», penny stocks, графики),
 # MarketWatch (личные финансы и мнения), The Economist (эссе, а не новости), SBS Biz (шортсы),
@@ -250,7 +294,7 @@ SYSTEM_PROMPT = """Ты — редактор новостной ленты дл�
 Тайвань, КНДР), перемирия и переговоры, санкции и экспортный контроль, пошлины и торговые войны, \
 перевороты, выборы и смена власти в крупных странах, политические решения ОПЕК+; \
 "KZ" — Казахстан/Центральная Азия; "KR" — Корея и корейские компании; "US" — США и остальное \
-глобальное (ФРС, данные, компании). Казахстанский сайт про Hyundai → "KR"; санкции против РФ → "MACRO"
+глобальное (ФРС, данные, компании). Казахстанский сайт про Hyundai → "KR"; санкции против РФ → "MACRO"{crypto_region}
 - "score": важность 1–5. Оценивай СТРОГО: 4–5 получают считаные новости в день, большинство — 1–2.
    5 — двигает рынки прямо сейчас: решение Fed/BoJ/BoK/НБК, неожиданные CPI/NFP, шок на рынке, \
 смена CEO или крупная сделка в мегакапе, начало/конец войны, удар по нефтяной инфраструктуре
@@ -273,7 +317,7 @@ SYSTEM_PROMPT = """Ты — редактор новостной ленты дл�
 Hyundai и других тяжеловесов KOSPI, чипы, потоки иностранцев, реформы рынка (Value-up, налоги). \
 Личные дела владельцев чеболей — 3 и только если затрагивают контроль или пакет акций. \
 Общество, спорт, внутренняя политика без влияния на рынок — 1.
-   MACRO: 4+ — эскалация или деэскалация с эффектом для нефти, валют, рынков: новые удары и фронты, \
+{crypto_scale}   MACRO: 4+ — эскалация или деэскалация с эффектом для нефти, валют, рынков: новые удары и фронты, \
 перемирие, новые пакеты санкций, пошлины. Рутинные сводки с фронта, заявления без действий — 2.
 - "title_ru": заголовок по-русски, коротко и по делу, как в новостном агентстве (до 110 знаков)
 - "summary": суть по-русски, 2–3 коротких предложения: что произошло, ключевые цифры, контекст. \
@@ -297,6 +341,12 @@ Watchlist: {watchlist}
 
 Ответь ТОЛЬКО массивом JSON."""
 
+CRYPTO_REGION = ('; "CRYPTO" — криптовалюты и крипторынок: биткоин, эфир, альткоины, биржи, стейблкоины, '
+                 'крипто-ETF, регулирование крипты, взломы')
+CRYPTO_SCALE = ("   CRYPTO: 4+ — события, которые двигают рынок: решения регуляторов (SEC, ETF, законы), притоки/оттоки "
+                "ETF, взломы и банкротства бирж, движение BTC/ETH больше 5% за день, крупные листинги и делистинги, "
+                "разблокировки токенов от $100 млн, покупки публичных компаний и государств. Прогнозы цен, мнения "
+                "«аналитиков», мемкоины, реклама проектов, «топ монет для покупки», технический анализ — 1–2.\n")
 KIND_LABEL = {"company": "🏢 Компании", "macro": "🏛 Макро", "market": "📊 Рынки", "geo": "🌍 Геополитика"}
 
 
@@ -709,7 +759,9 @@ def score_chunk(items, recent_titles):
     lines = [f"[{code}] ({it['source']}) {it['title']}\n{it['desc'][:DESC_LIMIT]}" for code, it in by_id.items()]
     recent = "\n".join(f"- {t}" for t in recent_titles[-40:]) or "(пусто)"
     user = f"Недавно отправлено:\n{recent}\n\nНовые новости:\n\n" + "\n\n".join(lines)
-    system = SYSTEM_PROMPT.replace("{watchlist}", ", ".join(WATCHLIST))
+    system = (SYSTEM_PROMPT.replace("{watchlist}", ", ".join(WATCHLIST))
+              .replace("{crypto_region}", CRYPTO_REGION if CRYPTO_ON else "")
+              .replace("{crypto_scale}", CRYPTO_SCALE if CRYPTO_ON else ""))
     result = extract_json(ask_ai(system, user, max_tokens=400 * len(items) + 800, as_json=True))
     if not isinstance(result, list):
         if len(items) > 1:  # пробуем половинками
@@ -732,7 +784,7 @@ def score_chunk(items, recent_titles):
         except (ValueError, TypeError):
             continue
         it["kind"] = str(r.get("kind") or "")
-        if r.get("region") in REGIONS:
+        if r.get("region") in ACTIVE:
             it["region"] = r["region"]
         it["title_ru"] = str(r.get("title_ru") or "")
         it["summary"] = str(r.get("summary") or it["summary"])
@@ -839,7 +891,7 @@ def check_calendar(state, now):
     cal = state["calendar"]
     week_key = f"{now:%G-W%V}"
     if now.weekday() == 0 and now.hour >= QUIET_TO and cal.get("week") != week_key:
-        for reg in REGIONS:
+        for reg in ACTIVE:
             upcoming = [e for e in events if e["region"] == reg and 0 <= e["t"] - now_ts <= 7 * 86400]
             if upcoming:
                 send_text(chats_for(reg), f"🗓 <b>Календарь недели</b> {REGIONS[reg]['flag']}\n\n"
@@ -872,39 +924,257 @@ def calendar_section(state, now, region):
 
 # ───────────────────────── дайджест ─────────────────────────
 
-def send_digest(state, now, region):
+def num(x, dec=2):
+    return f"{x:,.{dec}f}".replace(",", " ").replace(".", ",")
+
+
+def yahoo_quote(sym):
+    """Последнее ЗАКРЫТИЕ и изменение к предыдущему; если торги идут прямо сейчас — отдельно текущее движение."""
+    url = ("https://query1.finance.yahoo.com/v8/finance/chart/" + urllib.parse.quote(sym)
+           + "?range=10d&interval=1d")
+    r = json.loads(fetch(url, timeout=15))["chart"]["result"][0]
+    closes = r["indicators"]["quote"][0]["close"]
+    bars = [(t, c) for t, c in zip(r["timestamp"], closes) if c is not None]
+    reg = (r["meta"].get("currentTradingPeriod") or {}).get("regular") or {}
+    live = None
+    if len(bars) >= 3 and reg and bars[-1][0] >= reg.get("start", 9e12) and time.time() < reg.get("end", 0):
+        live = bars.pop()[1]          # сегодняшняя свеча ещё не закрыта (Корея в 9:00 Алматы уже торгуется)
+    if len(bars) < 2:
+        raise ValueError("мало данных")
+    (_, prev), (t, close) = bars[-2], bars[-1]
+    return {"close": close, "prev": prev, "chg": (close / prev - 1) * 100, "ts": t,
+            "live": (live / close - 1) * 100 if live else None}
+
+
+def quotes_block(state, region):
+    """→ (текст с таблицей, строки для ИИ)."""
+    rows, plain, live, dates = [], [], [], set()
+    k = state.get("kase_index")
+    if region == "KZ" and k:
+        rows.append(f"{'Индекс KASE':<12}{k['val']:>11}{k['chg']:>9}")
+        plain.append(f"Индекс KASE {k['val']} ({k['chg']})")
+        dates.add(k["date"])
+    with ThreadPoolExecutor(6) as ex:
+        def one(pair):
+            try:
+                return pair[0], pair[1], yahoo_quote(pair[1])
+            except Exception as e:
+                print(f"Котировка {pair[1]} не загрузилась: {e}", file=sys.stderr)
+                return pair[0], pair[1], None
+        got = list(ex.map(one, BRIEF_QUOTES.get(region, [])))
+    for name, sym, q in got:
+        if not q:
+            continue
+        if sym == "^TNX":   # доходность: уровень в % и изменение в базисных пунктах
+            val, chg = num(q["close"]) + "%", f"{(q['close'] - q['prev']) * 100:+.0f} бп"
+        else:
+            val, chg = num(q["close"]), f"{q['chg']:+.2f}%".replace(".", ",")
+        rows.append(f"{name:<12}{val:>11}{chg:>9}")
+        plain.append(f"{name} {val} ({chg})")
+        dates.add(datetime.fromtimestamp(q["ts"], timezone.utc).strftime("%d.%m"))
+        if q["live"] is not None:
+            live.append(f"{name} {q['live']:+.2f}%".replace(".", ","))
+    if not rows:
+        return "", []
+    text = "<pre>" + "\n".join(rows) + "</pre>\n<i>Закрытие " + ", ".join(sorted(dates)) + "</i>"
+    if live:
+        text += "\n<i>Сейчас торгуется:</i> " + " · ".join(live)
+    return text, plain
+
+
+def crypto_block():
+    """Рынок крипты (CoinGecko, без ключа): BTC, ETH, лидеры роста и падения среди топ-30, индекс страха."""
+    try:
+        coins = json.loads(fetch("https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd"
+                                 "&order=market_cap_desc&per_page=40&price_change_percentage=24h,7d", timeout=20))
+    except Exception as e:
+        print(f"CoinGecko не ответил: {e}", file=sys.stderr)
+        return "", []
+    stable = {"usdt", "usdc", "dai", "usde", "fdusd", "usds", "pyusd", "usd1", "wbtc", "steth", "wsteth", "weth"}
+    coins = [c for c in coins if c.get("symbol") not in stable and c.get("price_change_percentage_24h") is not None][:30]
+    pct = lambda x: f"{x:+.1f}%".replace(".", ",")
+    bln = lambda x: (f"{x / 1e9:.1f}".replace(".", ",") + " млрд") if x else "—"
+    rows, plain = [f"{'':<5}{'Цена, $':>10}{'24ч':>8}{'7д':>8}{'Объём 24ч':>12}"], []
+    for c in [c for c in coins if c["symbol"] in ("btc", "eth", "sol")]:
+        d7 = c.get("price_change_percentage_7d_in_currency")
+        rows.append(f"{c['symbol'].upper():<5}{num(c['current_price'], 0 if c['current_price'] > 1000 else 2):>10}"
+                    f"{pct(c['price_change_percentage_24h']):>8}{pct(d7) if d7 is not None else '':>8}"
+                    f"{'$' + bln(c.get('total_volume')):>12}")
+        plain.append(f"{c['symbol'].upper()} ${c['current_price']:.0f} ({pct(c['price_change_percentage_24h'])} за 24ч, "
+                     f"объём ${bln(c.get('total_volume'))})")
+    ranked = sorted(coins, key=lambda c: c["price_change_percentage_24h"])
+    mv = lambda cs: ", ".join(f"{c['symbol'].upper()} {pct(c['price_change_percentage_24h'])}" for c in cs)
+    up = [c for c in ranked[::-1] if c["price_change_percentage_24h"] > 0][:3]
+    down = [c for c in ranked if c["price_change_percentage_24h"] < 0][:3]
+    text = ("<pre>" + "\n".join(rows) + "</pre>\n"
+            f"📈 <b>Растут (топ-30, 24ч):</b> {mv(up) or '—'}\n📉 <b>Падают:</b> {mv(down) or '—'}")
+    plain += [f"растут: {mv(up)}", f"падают: {mv(down)}"]
+    # оборот = объём торгов за сутки к капитализации: где он необычно высокий, там сейчас основная активность
+    turn = sorted((c for c in coins if c.get("total_volume") and c.get("market_cap")),
+                  key=lambda c: -c["total_volume"] / c["market_cap"])[:3]
+    if turn:
+        tv = ", ".join(f"{c['symbol'].upper()} {c['total_volume'] / c['market_cap'] * 100:.0f}% (${bln(c['total_volume'])})"
+                       for c in turn)
+        text += f"\n🔥 <b>Самый высокий оборот</b> <i>(объём за 24ч к капитализации)</i>: {tv}"
+        plain.append(f"самый высокий оборот: {tv}")
+    try:
+        g = json.loads(fetch("https://api.coingecko.com/api/v3/global", timeout=15))["data"]
+        text += (f"\n🌐 <b>Весь рынок:</b> капитализация ${g['total_market_cap']['usd'] / 1e12:.2f} трлн "
+                 f"({pct(g['market_cap_change_percentage_24h_usd'])} за 24ч), объём ${bln(g['total_volume']['usd'])}, "
+                 f"доля BTC {g['market_cap_percentage']['btc']:.1f}%").replace(".", ",")
+        plain.append(f"капитализация рынка {pct(g['market_cap_change_percentage_24h_usd'])} за 24ч")
+    except Exception as e:
+        print(f"CoinGecko global не ответил: {e}", file=sys.stderr)
+    try:
+        fg = json.loads(fetch("https://api.alternative.me/fng/?limit=1", timeout=10))["data"][0]
+        text += f"\n😨 <b>Индекс страха и жадности:</b> {fg['value']} ({esc(fg['value_classification'])})"
+        plain.append(f"индекс страха и жадности {fg['value']}")
+    except Exception:
+        pass
+    return text + "\n<i>Это данные рынка, а не рекомендации</i>", plain
+
+
+def yahoo_stats(sym):
+    """Дневная история за 3 месяца → изменение за день, неделю (5 сессий), месяц (21 сессия) и объём к среднему."""
+    url = "https://query1.finance.yahoo.com/v8/finance/chart/" + urllib.parse.quote(sym) + "?range=3mo&interval=1d"
+    q = json.loads(fetch(url, timeout=15))["chart"]["result"][0]["indicators"]["quote"][0]
+    bars = [(c, v or 0) for c, v in zip(q["close"], q["volume"]) if c is not None]
+    if len(bars) < 23:
+        raise ValueError("мало данных")
+    c = [x[0] for x in bars]
+    prev = [v for _, v in bars[-21:-1] if v]
+    avg = sum(prev) / len(prev) if prev else 0
+    return {"d": (c[-1] / c[-2] - 1) * 100, "w": (c[-1] / c[-6] - 1) * 100, "m": (c[-1] / c[-22] - 1) * 100,
+            "vol": bars[-1][1] / avg if avg else 0}
+
+
+def yahoo_screen(scr):
+    """Готовые списки Yahoo (лидеры роста/объёма): одним запросом цена, объём, средний объём, капитализация."""
+    url = f"https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved?count=100&scrIds={scr}"
+    return json.loads(fetch(url, timeout=20))["finance"]["result"][0]["quotes"]
+
+
+def many(fn, syms, workers=8):
+    def one(s):
+        try:
+            return s, fn(s)
+        except Exception:
+            return s, None
+    with ThreadPoolExecutor(workers) as ex:
+        return [(s, r) for s, r in ex.map(one, syms) if r]
+
+
+def radar_chats():
+    """Радар идёт в свою тему (секрет TG_CHAT_RADAR); если она не задана — в канал US."""
+    ids = [c.strip() for c in os.environ.get("TG_CHAT_RADAR", "").split(",") if c.strip()]
+    return ids or (["«Радар»"] if DRY_RUN else chats_for("US"))
+
+
+def radar_text(state, now):
+    pct = lambda x: f"{x:+.1f}%".replace(".", ",")
+    x1 = lambda x: f"{x:.1f}".replace(".", ",")
+    parts = []
+    # 1) акции: необычный объём на росте
+    rows, src = [], ""
+    try:
+        seen = set()
+        for scr in ("day_gainers", "most_actives", "small_cap_gainers"):
+            for q in yahoo_screen(scr):
+                sym, vol, avg = q.get("symbol"), q.get("regularMarketVolume") or 0, q.get("averageDailyVolume3Month") or 0
+                cap, chg = q.get("marketCap") or 0, q.get("regularMarketChangePercent") or 0
+                if (sym in seen or sym in MEGACAPS or not avg or vol / avg < RADAR_VOL_X or chg < RADAR_MOVE
+                        or not RADAR_CAP[0] <= cap <= RADAR_CAP[1]):
+                    continue
+                seen.add(sym)
+                rows.append((vol / avg, sym, (q.get("shortName") or "")[:22], chg, f", кап. ${cap / 1e9:.0f} млрд"))
+        src = "весь рынок США"
+    except Exception as e:
+        print(f"Радар: списки Yahoo не открылись ({e}) — считаю по запасному списку акций", file=sys.stderr)
+        for sym, s in many(yahoo_stats, RADAR_UNIVERSE):
+            if s["vol"] >= RADAR_VOL_X and s["d"] >= RADAR_MOVE:
+                rows.append((s["vol"], sym, "", s["d"], ""))
+        src = f"список из {len(RADAR_UNIVERSE)} акций"
+    head = (f"📊 <b>Объём на росте</b> <i>(объём от ×{RADAR_VOL_X:g} к среднему, цена от +{RADAR_MOVE:g}%; {src})</i>\n")
+    if rows:
+        parts.append(head + "\n".join(
+            f"▫️ <b>{esc(sym)}</b>{' ' + esc(name) if name else ''} — {pct(chg)}, объём ×{x1(ratio)}{cap}"
+            for ratio, sym, name, chg, cap in sorted(rows, reverse=True)[:10]))
+    else:
+        parts.append(head + "▫️ сегодня таких нет")
+    # 2) отрасли: что растёт за неделю
+    names = dict((t, n) for n, t in INDUSTRIES)
+    ind = sorted(many(yahoo_stats, [t for _, t in INDUSTRIES]), key=lambda x: -x[1]["w"])
+    if ind:
+        def table(items):
+            return "\n".join(f"{names[t][:18]:<18}{pct(s['d']):>7}{pct(s['w']):>8}{pct(s['m']):>8}"
+                             + (f"  ×{x1(s['vol'])}" if s["vol"] >= 1.5 else "") for t, s in items)
+        txt = ("🏭 <b>Отрасли: лидеры недели</b>\n<pre>" + f"{'':<18}{'день':>7}{'неделя':>8}{'месяц':>8}\n"
+               + table(ind[:7]) + "</pre>")
+        if len(ind) > 10:
+            txt += "\n<b>Аутсайдеры недели</b>\n<pre>" + table(ind[-3:]) + "</pre>"
+        parts.append(txt + "\n<i>×N — объём в отраслевом ETF выше среднего в N раз</i>")
+    return "📡 <b>Радар</b>\n\n" + "\n\n".join(parts)
+
+
+def send_digest(state, now, region, brief=False):
+    """Вечером — дайджест того, что не вошло в ленту. Утром (brief) — сводка: котировки + главное за сутки."""
     queue = [q for q in state["queue"] if q.get("region", "US") == region]
     state["queue"] = [q for q in state["queue"] if q.get("region", "US") != region]
     cal = calendar_section(state, now, region)
     chats = chats_for(region)
-    if not queue:
+    quotes, plain = (crypto_block() if region == "CRYPTO" else quotes_block(state, region)) if brief else ("", [])
+    sent = [s for s in state.get("sent_items", []) if s["r"] == region and s["ts"] > now.timestamp() - 24 * 3600]
+    if not queue and not quotes:
         if cal:
             send_text(chats, cal)
         return
     queue.sort(key=lambda x: (-x["score"], -(x["ts"] or 0)))
-    title = "🌅 Утренний дайджест" if now.hour < 12 else "🌆 Вечерний дайджест"
-    parts = [f"{REGIONS[region]['flag']} <b>{title}</b>\n<i>Не вошло в ленту: {len(queue)}</i>"]
-    if AI_ON:
+    if brief:
+        parts = [f"{REGIONS[region]['flag']} <b>Утренняя сводка · {now:%d.%m}</b>"]
+        if quotes:
+            parts.append(quotes)
+    else:
+        parts = [f"{REGIONS[region]['flag']} <b>🌆 Вечерний дайджест</b>\n<i>Не вошло в ленту: {len(queue)}</i>"]
+    if AI_ON and (queue or sent or plain):
         lst = "\n".join(f"- ({q['score']}/5) {q['title']}: {q['summary']}" for q in queue[:40])
-        brief = ask_ai("Ты — редактор новостей для инвест-аналитика. Напиши по-русски 3–5 "
-                       "коротких пунктов «главное», каждый с новой строки и начиная с «• ». "
-                       "Только факты из списка, без вступления.", lst, max_tokens=600)
         if brief:
-            parts.append("<b>Главное</b>\n<blockquote>" + esc(brief.strip()) + "</blockquote>")
-    lines = [f'{"📌 " if q.get("watch") else "▫️ "}<a href="{html.escape(q["link"])}">{esc(q["title"])}</a>'
-             for q in queue[:15]]
-    parts.append("<b>Все новости</b>\n" + "\n".join(lines))
+            lst = ("Рынок: " + "; ".join(plain) + "\n\nУже отправлено в ленту за сутки:\n"
+                   + "\n".join(f"- ({s['s']}/5) {s['t']}" for s in sent[-30:]) + "\n\nНе вошло в ленту:\n" + lst)
+            ask = ("Ты — редактор утренней сводки для инвест-аналитика. Напиши по-русски 2–3 коротких предложения: "
+                   "чем закрылся рынок и что было главным за сутки. Только факты и цифры из данных ниже, "
+                   "без советов, прогнозов и рекомендаций что покупать. Без вступления и без списков.")
+        else:
+            ask = ("Ты — редактор новостей для инвест-аналитика. Напиши по-русски 3–5 "
+                   "коротких пунктов «главное», каждый с новой строки и начиная с «• ». "
+                   "Только факты из списка, без вступления.")
+        text = ask_ai(ask, lst, max_tokens=600)
+        if text:
+            parts.append("<b>Главное</b>\n<blockquote>" + esc(text.strip()) + "</blockquote>")
+    if queue:
+        lines = [f'{"📌 " if q.get("watch") else "▫️ "}<a href="{html.escape(q["link"])}">{esc(q["title"])}</a>'
+                 for q in queue[:10 if brief else 15]]
+        parts.append(f"<b>{'Не вошло в ленту' if brief else 'Все новости'}</b>\n" + "\n".join(lines))
     if cal:
         parts.append(cal)
     send_text(chats, "\n\n".join(parts))
+    if brief and region == "US" and RADAR:
+        try:
+            radar = radar_text(state, now)
+            if radar:
+                send_text(radar_chats(), radar)
+        except Exception as e:
+            print(f"Радар не собран: {e!r}", file=sys.stderr)
 
 
 def maybe_digest(state, now):
     for h in DIGEST_HOURS:
         key = f"{now:%Y-%m-%d}-{h}"
         if h <= now.hour < h + 3 and key not in state["digests"]:
-            for reg in REGIONS:
-                send_digest(state, now, reg)
+            for reg in ACTIVE:
+                try:
+                    send_digest(state, now, reg, brief=(h == BRIEF_HOUR))
+                except Exception as e:
+                    print(f"Сводка {reg} не отправлена: {e!r}", file=sys.stderr)
             state["digests"] = (state["digests"] + [key])[-20:]
 
 
@@ -942,6 +1212,8 @@ def save_state(state):
     state["recent"] = [r for r in state["recent"] if r["ts"] > cutoff][-400:]
     state["queue"] = state["queue"][-300:]
     state["sent_log"] = [x for x in state["sent_log"] if x[0] > time.time() - 3600]
+    state.pop("mentions", None)
+    state["sent_items"] = [x for x in state.get("sent_items", []) if x["ts"] > time.time() - 30 * 3600][-300:]
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False)
 
@@ -1002,6 +1274,14 @@ def check_news(state, now):
                 print(f"[{source}] не загрузился", file=sys.stderr)
             continue
         first_time = source not in state["feeds"]
+        if source == "KASE":
+            for it in items:
+                m = re.search(r"(\d{1,2} [а-я]+) значение Индекса KASE (\w+) на ([\d,]+)\s*% до ([\d\s\u00a0,]+\d)", it["title"])
+                if m:
+                    sign = "−" if m.group(2).startswith(("сниз", "упал", "пониз")) else "+"
+                    state["kase_index"] = {"date": m.group(1), "val": m.group(4).replace("\u00a0", " "),
+                                           "chg": f"{sign}{m.group(3)}%"}
+                    break
         if SAMPLE:  # тестовый режим: берём N свежих из каждой ленты, даже если уже видели
             items = sorted(items, key=lambda x: x["ts"] or 0)[-SAMPLE:]
         for it in items:
@@ -1062,7 +1342,7 @@ def check_news(state, now):
         print(f"{now:%H:%M} несрочных {len(todo)} — подождут следующей пачки")
         return
     quiet = in_quiet(now)
-    sent = {r: 0 for r in REGIONS}
+    sent = {r: 0 for r in ACTIVE}
     all_ai = True
 
     def queue(it, summary=None):
@@ -1104,6 +1384,8 @@ def check_news(state, now):
             queue(it); log.append((sc, f"лимит в час → дайджест {reg}", it)); return False
         if ok:
             state["sent_log"].append([now_ts, reg]); sent[reg] += 1
+            state.setdefault("sent_items", []).append(
+                {"t": it.get("title_ru") or it["title"], "r": reg, "s": it["score"], "ts": now_ts})
             log.append((sc, f"→ {reg}", it)); return True
         queue(it); log.append((sc, f"в дайджест {reg}", it))
         return False
@@ -1153,7 +1435,7 @@ def main():
         sys.exit("Укажите TG_TOKEN")
     if DRY_RUN:
         print(f"🧪 DRY_RUN: в Telegram ничего не уходит, состояние пишется в {STATE_FILE}")
-    missing = [r for r in REGIONS if not os.environ.get(REGIONS[r]["env"])]
+    missing = [r for r in ACTIVE if not os.environ.get(REGIONS[r]["env"])]
     if missing and not PERSONAL and not DRY_RUN:
         sys.exit("Укажите каналы TG_CHAT_KZ/KR/US или хотя бы TG_CHAT_ID")
     if not AI_ON:
@@ -1181,6 +1463,16 @@ def main():
         else:
             send("⚠️ Не задан секрет TG_CHAT_MACRO — геополитика пока идёт сюда, в личку.")
         state["v4"] = True
+    if "--brief" in sys.argv:   # утренняя сводка прямо сейчас (для проверки удобно вместе с DRY_RUN=1)
+        now = datetime.now(LOCAL_TZ)
+        for reg in ACTIVE:
+            try:
+                send_digest(state, now, reg, brief=True)
+            except Exception as e:
+                print(f"Сводка {reg} не отправлена: {e!r}", file=sys.stderr)
+        if not DRY_RUN:
+            save_state(state)
+        return
     minutes = None
     if "--minutes" in sys.argv:
         minutes = int(sys.argv[sys.argv.index("--minutes") + 1])
