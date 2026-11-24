@@ -2,10 +2,12 @@
 """
 Vitis Bonds Bot — облигации KASE и AIX → тема «Bonds Alert».
 
-1) Алерты (каждые ~30 мин):
-   🆕 новые выпуски и размещения · 📄 отчётность эмитентов · ⚠️ дефолты, 🔁 выкупы, 🚫 делистинг
-   ⭐ рейтинги · 💸 выплаты купонов (собираются в одну сводку за день, чтобы не спамить)
-   У каждого алерта пометка биржи: 🏛 KASE / 🌐 AIX
+1) Алерты (каждые ~10 мин), БЕЗ ИИ — новости KASE шаблонные, разбираются правилами (ничего не теряется,
+   когда у Gemini кончился лимит):
+   сразу, отдельным постом: 🆕 листинг и открытие торгов · 💰 итоги размещения · ⚠️ дефолты ·
+     🔁 выкупы · 🚫 делистинг · ⏸ приостановка торгов · ⭐ рейтинги
+   списком за проверку: 💸 выплаты купонов · 📄 отчётность эмитентов облигаций (с пометкой периода) ·
+     ✅ погашения · 📣 размещения и подписки сегодня · 🏛 аукционы Минфина
 2) Ежедневно после торгов (по умолчанию 18:30 Алматы, Пн–Пт), данные — API KASE (все выпуски):
    графики KZT (к кривой ГЦБ) и USD (к кривой UST), G-спреды, средние по секторам,
    самые широкие/узкие спреды, изменение кривой за день,
@@ -14,6 +16,7 @@ Vitis Bonds Bot — облигации KASE и AIX → тема «Bonds Alert».
 Использует общие функции из bot.py (тот же бот, тот же ключ Gemini).
   python bonds.py --once      — проверка алертов + отчёт по кривой, если пора
   python bonds.py --report    — отправить отчёт по кривой прямо сейчас
+  DRY_RUN=1 python bonds.py --once --sample — тест без Telegram на всём, что сейчас в лентах
 Нужны пакеты numpy, matplotlib, openpyxl (ставятся в workflow).
 
 Секреты: TG_TOKEN, TG_CHAT_BONDS (-100XXXXXXXXXX:номер_темы), GEMINI_API_KEY, TG_CHAT_ID (служебные)
@@ -33,14 +36,15 @@ import urllib.request
 from datetime import datetime, timedelta
 
 import bot  # общие функции новостного бота
-from bot import (LOCAL_TZ, AI_ON, fetch, clean, esc, gnews, parse_feed, parse_html_news,
-                 ask_ai, extract_json, send_text, target, similar, local)
+from bot import (LOCAL_TZ, DRY_RUN, fetch, clean, esc, gnews, parse_feed, parse_html_news,
+                 send_text, target, similar, local)
 
 # ════════════════════ НАСТРОЙКИ ════════════════════
 
 REPORT_TIME = (18, 30)        # когда отправлять кривую (Алматы), только Пн–Пт
-STATE_FILE = os.environ.get("BONDS_STATE_FILE", "bonds_state.json")
-CHATS = [c.strip() for c in os.environ.get("TG_CHAT_BONDS", "").split(",") if c.strip()] or bot.PERSONAL
+STATE_FILE = os.environ.get("BONDS_STATE_FILE", "bonds_state.dry.json" if DRY_RUN else "bonds_state.json")
+CHATS = ([c.strip() for c in os.environ.get("TG_CHAT_BONDS", "").split(",") if c.strip()] or bot.PERSONAL
+         or (["«Bonds Alert»"] if DRY_RUN else []))
 
 
 ALERT_FEEDS = [
@@ -56,28 +60,6 @@ ALERT_FEEDS = [
     ("Рейтинги", gnews("рейтинг (Fitch OR Moody's OR S&P OR \"Эксперт РА\") Казахстан облигации when:2d", "ru", "KZ")),
     ("Облигации KZ", gnews("облигации Казахстан (размещение OR купон OR дефолт OR выкуп) when:1d", "ru", "KZ")),
 ]
-
-# Предфильтр: в тексте должно быть что-то про долг
-BOND_RE = re.compile(
-    r"облигац|бонд|купон|еврооблигац|сукук|ноты|коммерческ\w+ облигац|рейтинг|отчетност|отчётност|"
-    r"финансов\w+ (отчет|отчёт|результат)|дефолт|выкуп|погашени|размещени|листинг|делистинг|"
-    r"\bbonds?\b|eurobond|\bnotes?\b|sukuk|coupon|rating|outlook|default|buyback|repurchase|"
-    r"redemption|placement|listing|financial (statements|results)|IFRS|МСФО", re.I)
-# Отсекаем то, что к облигациям не относится
-NOT_BOND_RE = re.compile(
-    r"закрылись торги следующими инструментами рынка иностранных валют|"
-    r"(приостановлены|возобновлены) торги .{0,80}по операциям репо|"
-    r"KASE Global|ETF|паев\w* инвестиционн", re.I)
-
-CATEGORIES = {
-    "placement": "🆕 Размещение",
-    "report": "📄 Отчётность",
-    "default": "⚠️ Дефолт / невыплата",
-    "buyback": "🔁 Выкуп / досрочное погашение",
-    "delisting": "🚫 Делистинг",
-    "rating": "⭐ Рейтинг",
-    "coupon": "💸 Купон",
-}
 
 # Сектора по названию эмитента (первое совпадение)
 SECTORS = [
@@ -105,6 +87,11 @@ SECTORS = [
 
 def send_photo_file(chats, png_bytes, caption):
     """Отправка картинки из памяти (multipart)."""
+    if DRY_RUN:
+        with open("dry_curve.png", "wb") as f:
+            f.write(png_bytes)
+        print("🧪 график сохранён в dry_curve.png")
+        return send_text(chats, caption)
     for chat in chats:
         boundary = uuid.uuid4().hex
         fields = {**target(chat), "caption": caption[:1024], "parse_mode": "HTML"}
@@ -331,8 +318,15 @@ def build_report(now, prev):
     if not ust_pts:  # запасной вариант — UST, торгующиеся на KASE
         ust_pts = [(b["years"], b["yield"]) for b in ust_kase if is_fresh(b, now, 90) and b["years"]]
         ust_date = "KASE"
-    usd = robust_fit(ust_pts)[0] if ust_pts and len(ust_pts) >= 5 else None
-    ucurve = (lambda m: float(ns_yield([max(m, 0.02)], *usd)[0])) if usd else None
+    # UST публикуются в bond-equivalent (полугодовое начисление) → переводим в годовую эффективную,
+    # как у доходностей KASE; между точками — линейная интерполяция (точнее, чем сглаживание Nelson-Siegel)
+    usd = ucurve = None
+    if ust_pts and len(ust_pts) >= 5:
+        if ust_date != "KASE":
+            ust_pts = [(m, ((1 + y / 200) ** 2 - 1) * 100) for m, y in ust_pts]
+        ust_pts = sorted(ust_pts)
+        ux, uy = [p[0] for p in ust_pts], [p[1] for p in ust_pts]
+        usd = ucurve = lambda m: float(np.interp(m, ux, uy))
 
     universe = corp + muni
     for b in universe:
@@ -351,7 +345,7 @@ def build_report(now, prev):
         groups = {}
         for b in bonds:
             groups.setdefault(b["sector"], []).append(b)
-        return sorted(((s, len(v), float(np.mean([x["yield"] for x in v])), float(np.median([x["g"] for x in v])))
+        return sorted(((s, len(v), float(np.median([x["yield"] for x in v])), float(np.median([x["g"] for x in v])))
                        for s, v in groups.items()), key=lambda r: -r[3])
 
     def flag(b):
@@ -391,7 +385,7 @@ def draw_chart(rep, date_str):
                  else "Кривая ГЦБ (по сделкам)")
     panels = [("KZT", rep["curve"], rep["gov"], rep["kzt_live"], kzt_label)]
     if rep["usd"] and rep["usd_live"]:
-        panels.append(("USD", lambda m: float(ns_yield([m], *rep["usd"])[0]), rep["ust_pts"], rep["usd_live"], "Кривая UST"))
+        panels.append(("USD", rep["usd"], rep["ust_pts"], rep["usd_live"], "Кривая UST"))
     fig, axes = plt.subplots(1, len(panels), figsize=(7.2 * len(panels), 6), dpi=150, squeeze=False)
     fig.patch.set_facecolor("#0f1720")
     for ax, (cur, fn, base_pts, bonds, label) in zip(axes[0], panels):
@@ -550,10 +544,15 @@ def report_texts(rep, date_str, coupons):
         parts.append(f"💸 <b>Купоны за день</b> ({len(coupons)})\n" + "\n".join(
             f'▫️ <a href="{html.escape(c["link"])}">{esc(c["title"])}</a>' for c in coupons[:20]))
     if rep["anomalies"]:
-        parts.append(f"⚠️ <b>Исключены как подозрительные: {len(rep['anomalies'])}</b> — " + ", ".join(
-            f"{esc(b['ticker'])} ({fmt_pct(b['yield'])})" for b in rep["anomalies"][:8])
-            + ("…" if len(rep["anomalies"]) > 8 else "") + "\n<i>Скорее всего валютная индексация или случайная "
-            "цена сделки. В Excel помечены в колонке «Примечание».</i>")
+        low = [b for b in rep["anomalies"] if b["g"] < 0]
+        high = [b for b in rep["anomalies"] if b["g"] >= 0]
+        names = lambda bs: ", ".join(f"{esc(b['ticker'])} ({fmt_pct(b['yield'])})" for b in bs[:8]) + ("…" if len(bs) > 8 else "")
+        txt = f"⚠️ <b>Исключены из средних как подозрительные: {len(rep['anomalies'])}</b>"
+        if low:
+            txt += f"\n▫️ намного ниже кривой: {names(low)} — <i>скорее всего валютная индексация или случайная цена</i>"
+        if high:
+            txt += f"\n▫️ аномально высокая доходность: {names(high)} — <i>дистресс или сделка по случайной цене, проверить</i>"
+        parts.append(txt + "\n<i>В Excel помечены в колонке «Примечание».</i>")
     src = ("G-спред — к официальной кривой ГЦБ KASE (в годовой доходности)" if rep["official"] else
            f"Кривая ГЦБ по {rep['kzt_n']} выпускам со сделками за {FRESH_DAYS_GOV} дней, "
            f"точность ±{rep['kzt_rmse'] * 100:.0f} бп")
@@ -562,6 +561,11 @@ def report_texts(rep, date_str, coupons):
 
 
 def send_document(chats, data, filename, caption=""):
+    if DRY_RUN:
+        with open("dry_" + filename, "wb") as f:
+            f.write(data)
+        print(f"🧪 файл сохранён: dry_{filename}")
+        return
     for chat in chats:
         boundary = uuid.uuid4().hex
         fields = {**target(chat), "caption": caption[:1024], "parse_mode": "HTML"}
@@ -582,7 +586,7 @@ def send_document(chats, data, filename, caption=""):
 def send_report(state, now):
     rep = build_report(now, state.get("curve", {}))
     date_str = f"{now:%d.%m.%Y}"
-    caption, text = report_texts(rep, date_str, state.get("coupons", []))
+    caption, text = report_texts(rep, date_str, [])
     send_photo_file(CHATS, draw_chart(rep, date_str), caption)
     send_text(CHATS, text)
     send_document(CHATS, build_excel(rep, date_str), f"KASE_bonds_{now:%Y-%m-%d}.xlsx",
@@ -594,30 +598,137 @@ def send_report(state, now):
           f"без сделок {len(rep['no_deals'])}")
 
 
-# ───────────────────────── алерты ─────────────────────────
+# ───────────────────────── алерты (правила, без ИИ) ─────────────────────────
 
-ALERT_PROMPT = """Ты — аналитик долгового рынка Казахстана. Тебе дают новости. Для КАЖДОЙ верни JSON:
-- "i": номер
-- "category": "placement" (новый выпуск, регистрация, листинг, аукцион/подписка, итоги размещения),
-  "report" (финансовая отчётность эмитента облигаций: квартальная, годовая, МСФО),
-  "coupon" (плановая выплата купона), "default" (невыплата, просрочка, дефолт, реструктуризация),
-  "buyback" (выкуп, досрочное погашение, оферта), "delisting" (исключение из листинга),
-  "rating" (присвоение/изменение рейтинга или прогноза: Fitch, S&P, Moody's, Эксперт РА и т.п.),
-  "other" — всё прочее (акции, ETF, валюта, репо, общие новости биржи)
-- "title_ru": короткий заголовок по-русски (до 100 знаков)
-- "summary": суть по-русски, 1–2 предложения, с цифрами
-- "issuer": эмитент или ""
-- "ticker": тикер выпуска или ""
-- "amount": объём (напр. "100 млрд ₸", "$500 млн") или ""
-- "yield": доходность (напр. "15,60%") или ""
-- "coupon": купон или ""
-- "maturity": срок/погашение или ""
-- "rating": для рейтингов — что было → что стало и прогноз (напр. "BB+ → BBB−, прогноз «Стабильный»") или ""
-- "why": одно предложение — почему это важно для инвестора в облигации (риск, спред, ликвидность, сигнал для сектора)
-- "exchange": где обращаются бумаги: "KASE", "AIX", "KASE, AIX" или "" (если не ясно)
-- "dup": true, если это та же новость, что выше в списке или в «уже было»
+DEBT_RE = re.compile(r"облигац|бонд|купон|еврооблигац|сукук|\bнот[ыа]?\b|МЕУКАМ|МЕОКАМ|МЕККАМ|МЕУЖКАМ|"
+                     r"\bbonds?\b|eurobonds?|\bnotes\b|sukuk|coupon", re.I)
+GOV_RE = re.compile(r"МЕУКАМ|МЕОКАМ|МЕККАМ|МЕУЖКАМ|МУИКАМ|МЕИКАМ|нот\w* Национального Банка|Министерств\w+ финансов|"
+                    r"Минфин", re.I)
+AGENCY_RE = re.compile(r"fitch|moody|s&p|s&amp;p|standard & poor|эксперт ра|acra|акра", re.I)
+KZ_CTX_RE = re.compile(r"kazakh|казахстан|kase|aix|astana|almaty|тенге", re.I)
+NOISE_RE = re.compile(r"репо|иностранными валютами|своп|KASE Global|ETF|паев|маркет-мейкер|Индекс\w* KASE|"
+                      r"результаты торгов|итоги торгов акци", re.I)
 
-Ответь ТОЛЬКО массивом JSON."""
+# категория → (значок и название, отдельным постом?)
+CATEGORIES = {
+    "default":   ("⚠️ Дефолт / невыплата", True),
+    "halt":      ("⏸ Торги приостановлены", True),
+    "listing":   ("🆕 Новый выпуск", True),
+    "result":    ("💰 Итоги размещения", True),
+    "buyback":   ("🔁 Выкуп / досрочное погашение", True),
+    "delisting": ("🚫 Делистинг", True),
+    "rating":    ("⭐ Рейтинг", True),
+    "auction":   ("📣 Размещения и подписки сегодня", False),
+    "gov":       ("🏛 Аукционы Минфина и НБК", False),
+    "coupon":    ("💸 Выплаты купонов", False),
+    "matured":   ("✅ Погашения", False),
+    "report":    ("📄 Отчётность эмитентов облигаций", False),
+}
+
+
+def classify(title, source="KASE"):
+    """Категория новости по заголовку или None. Порядок проверок важен: сначала плохие новости."""
+    t = title
+    low = t.lower()
+    if NOISE_RE.search(t):
+        return None
+    debt = bool(DEBT_RE.search(t))
+    if re.search(r"дефолт|не выплати|невыплат|не исполни|неисполнен|просроч|задерж\w+ (выплат|исполнен)|"
+                 r"несвоевременн|реструктуризац|\bdefault|missed (coupon|payment)|restructur", low) and \
+            (debt or source != "KASE"):
+        return "default"
+    if AGENCY_RE.search(t) and re.search(r"рейтинг|rating|outlook|прогноз|affirm|upgrade|downgrade|"
+                                         r"подтверд|повыс|пониз|присво", low):
+        return "rating" if (source == "KASE" or KZ_CTX_RE.search(t)) else None
+    if re.search(r"финансов\w+ отч[её]тност|аудиторск\w+ отч[её]т|годово\w+ отч[её]т|financial statements|"
+                 r"отч[её]тност\w* за |финансов\w+ результат", low):
+        return "report"
+    if not debt:
+        return None
+    if re.search(r"приостановлен\w* торг|торги .{0,60}приостановлен|trading .{0,30}suspend", low):
+        return "halt"
+    if re.search(r"исключен\w* из официального списка|delist", low):
+        return "matured" if re.search(r"истечени\w+ срока обращения|погашени", low) else "delisting"
+    if re.search(r"купон|coupon", low) and re.search(r"выплат|paid|payment", low):
+        return "coupon"
+    if re.search(r"выкуп|досрочн\w+ погаш|оферт|buyback|repurchase|early redemption|tender offer", low):
+        return "buyback"
+    if re.search(r"погасил|погашен\w* облигац|выплат\w+ основно\w+ долг|redeem|redemption", low):
+        return "matured"
+    if re.search(r"привлек\w* на kase|привлек\w* .{0,40}размести|итоги размещени|результаты размещени|"
+                 r"размести\w* .{0,80}облигац|raises? .{0,40}(bonds?|notes|sukuk)|priced", low):
+        return "gov" if GOV_RE.search(t) else "result"
+    if re.search(r"специализированные торги|подписк\w* на|проводится подписка|аукцион|book.?build", low):
+        return "gov" if GOV_RE.search(t) else "auction"
+    if re.search(r"включен\w* в официальный список|прош\w+ процедуру листинга|открываются торги|"
+                 r"открыты торги|зарегистрирован\w* выпуск|регистраци\w+ выпуска|"
+                 r"admitted|admission|list(s|ed|ing) .{0,60}(bonds?|notes|sukuk)|new (bond|sukuk|notes?) ", low):
+        return "listing"
+    return None
+
+
+def report_period(title):
+    low = title.lower()
+    m = re.search(r"(январ\w*\s*[–-]\s*(март|июн|сентябр|декабр)\w*|[1-4i]{1,3}\s*квартал|первое полугодие|"
+                  r"полугоди\w*|(3|6|9|три|шесть|девять) месяц\w*)[^,.;]{0,12}?(20\d\d)?", low)
+    if m:
+        return "квартальная · " + m.group(0).strip()
+    m = re.search(r"за (20\d\d) год", low)
+    return f"годовая · {m.group(1)}" if m else ""
+
+
+TICKER_RE = re.compile(r"\(([A-Za-z0-9_]{4,14})\)")
+ISIN_RE = re.compile(r"\b(KZ[0-9A-Z]{10})\b")
+
+
+def name_key(s):
+    s = re.sub(r"\b(ао|тоо|jsc|llp|нао|plc|ltd|limited|company|компания|микрофинансовая организация|мфо)\b", " ",
+               s.lower())
+    return re.sub(r"[^a-zа-яё0-9]", "", s)
+
+
+_api = {}
+
+
+def kase_bonds():
+    """Все корпоративные облигации KASE (один запрос за запуск): тикер → бумага, + имена эмитентов."""
+    if "by" not in _api:
+        try:
+            raw = fetch_json(API_CORP)
+            now = datetime.now(LOCAL_TZ)
+            _api["by"] = {(x.get("code") or "").upper(): norm(x, now) for x in raw}
+            names = set()
+            for x in raw:
+                for k in ("org_short_name_ru", "org_name_ru", "org_name_en"):
+                    n = name_key(x.get(k) or "")
+                    if len(n) >= 4:
+                        names.add(n)
+            _api["issuers"] = names
+        except Exception as e:
+            print(f"API KASE недоступен ({e}) — алерты без параметров выпуска", file=sys.stderr)
+            _api["by"], _api["issuers"] = {}, None
+    return _api["by"], _api["issuers"]
+
+
+def is_bond_issuer(title):
+    """Отчётность интересна только по эмитентам, у которых есть облигации на KASE."""
+    _, issuers = kase_bonds()
+    if issuers is None:
+        return True   # список не получили — лучше показать лишнее, чем потерять
+    key = name_key(title)
+    return any(n in key for n in issuers)
+
+
+def kase_body(link):
+    """Первый абзац новости KASE (там параметры выпуска: объём, срок, купон)."""
+    if "kase.kz" not in link:
+        return ""
+    try:
+        text = clean(fetch(link, timeout=15).decode("utf-8", "ignore"))
+        m = re.search(r"/KASE,\s*\d\d\.\d\d\.\d\d/\s*[–—-]\s*(.+?)\s*\[\d{4}-\d\d-\d\d\]", text)
+        return m.group(1)[:700] if m else ""
+    except Exception:
+        return ""
 
 
 def load_alerts(state, now_ts):
@@ -633,100 +744,94 @@ def load_alerts(state, now_ts):
         first = key0 not in state["feeds"]
         for it in items:
             key = f"{source}|{it['link']}"
-            if key in state["seen"]:
-                continue
+            known = key in state["seen"]
             state["seen"][key] = now_ts
-            if not first:
-                it["source"] = source
-                if "news.google.com" in it["link"]:
-                    it["title"] = re.sub(r"\s+-\s+[^-]{2,40}$", "", it["title"])
-                fresh.append(it)
+            if (known or first) and "--sample" not in sys.argv:   # --sample: тест на всём, что сейчас в лентах
+                continue
+            it["source"] = source
+            if "news.google.com" in it["link"]:
+                it["title"] = re.sub(r"\s+-\s+[^-]{2,40}$", "", it["title"])
+            fresh.append(it)
         if first:
             state["feeds"].append(key0)
             print(f"[{source}] подключён: {url[:70]} ({len(items)})")
     return fresh
 
 
-EXCH_ICON = {"KASE": "🏛 KASE", "AIX": "🌐 AIX"}
-
-
-def exchange_label(a):
-    ex = str(a.get("exchange") or "").upper()
-    found = [k for k in ("KASE", "AIX") if k in ex]
-    if not found and a["source"] in EXCH_ICON:  # по источнику
-        found = [a["source"]]
-    if not found:
-        text = f"{a['title']} {a.get('desc', '')}"
-        found = [k for k in ("KASE", "AIX") if re.search(k, text, re.I)]
-    return " · ".join(EXCH_ICON[k] for k in found)
+def short(title, n=150):
+    t = re.sub(r"^Сегодня на KASE (проводятся|проводится)\s+", "", title).strip()
+    t = t[:1].upper() + t[1:]
+    return t if len(t) <= n else t[:n - 1].rsplit(" ", 1)[0] + "…"
 
 
 def fmt_alert(a):
-    cat = CATEGORIES.get(a["category"], "🔔 Облигации")
-    ex = exchange_label(a)
-    parts = [f"{cat}{' · ' + ex if ex else ''}\n<b>{esc(a.get('title_ru') or a['title'])}</b>"]
-    if a.get("summary"):
-        parts.append(f"<blockquote>{esc(a['summary'])}</blockquote>")
-    params = [(k, a.get(f)) for k, f in (("Эмитент", "issuer"), ("Тикер", "ticker"), ("Объём", "amount"),
-              ("Доходность", "yield"), ("Купон", "coupon"), ("Срок", "maturity"), ("Рейтинг", "rating")) if a.get(f)]
-    if params:
-        parts.append("\n".join(f"▫️ {k}: <b>{esc(str(v))}</b>" for k, v in params))
-    if a.get("why"):
-        parts.append(f"💡 <b>Почему важно:</b> {esc(a['why'])}")
+    label = CATEGORIES[a["category"]][0]
+    ex = a["source"] if a["source"] in ("KASE", "AIX") else ""
+    parts = [f"{label}{' · ' + ('🏛 KASE' if ex == 'KASE' else '🌐 AIX') if ex else ''}\n<b>{esc(a['title'])}</b>"]
+    body = kase_body(a["link"]) or a.get("desc", "")[:400]
+    if body and not body.lower().startswith(a["title"][:40].lower()):
+        parts.append(f"<blockquote>{esc(body)}</blockquote>")
+    m = TICKER_RE.search(a["title"])
+    b = kase_bonds()[0].get(m.group(1).upper()) if m else None
+    if b:
+        bits = [f"Тикер: <b>{esc(b['ticker'])}</b>", f"сектор: {esc(b['sector'])}"]
+        if b["coupon"]:
+            bits.append(f"купон: <b>{fmt_pct(b['coupon'])}</b>")
+        if b["maturity"]:
+            bits.append(f"погашение: <b>{esc(str(b['maturity'])[:10])}</b>")
+        if b["yield"]:
+            bits.append(f"доходность: <b>{fmt_pct(b['yield'])}</b>")
+        parts.append("▫️ " + " · ".join(bits) + f'\n▫️ <a href="{BOND_URL.format(code=b["ticker"])}">Карточка выпуска на KASE</a>')
     when = f" · {local(a['ts']):%d.%m %H:%M}" if a.get("ts") else ""
     parts.append(f'🔗 <a href="{html.escape(a["link"])}">{esc(a["source"])}</a><i>{when}</i>')
     return "\n\n".join(parts)
 
 
+def fmt_list(cat, items):
+    label = CATEGORIES[cat][0]
+    lines = []
+    for a in items[:40]:
+        extra = f" <i>({esc(a['period'])})</i>" if a.get("period") else ""
+        lines.append(f'▫️ <a href="{html.escape(a["link"])}">{esc(short(a["title"]))}</a>{extra}')
+    more = f"\n<i>…и ещё {len(items) - 40}</i>" if len(items) > 40 else ""
+    return f"{label} <b>({len(items)})</b>\n\n" + "\n".join(lines) + more
+
+
 def check_alerts(state, now):
     now_ts = int(now.timestamp())
     fresh = load_alerts(state, now_ts)
-    cand = [it for it in fresh if BOND_RE.search(f"{it['title']} {it['desc'][:300]}")
-            and not NOT_BOND_RE.search(it["title"])]
-    pending = state.pop("pending", [])
     recent = [r["title"] for r in state["recent"]]
-    uniq = []
-    for it in cand:
-        if any(similar(it["title"], t) for t in recent + [u["title"] for u in uniq]):
+    single, lists, skipped = [], {}, 0
+    for it in fresh:
+        cat = classify(it["title"], it["source"])
+        if cat == "report" and not is_bond_issuer(it["title"]):
+            cat = None
+        # у KASE одинаковые по шаблону заголовки — это разные выпуски, дубли там только по ссылке;
+        # для пересказов из СМИ сравниваем заголовки
+        if cat and it["source"] != "KASE" and any(similar(it["title"], t) for t in recent):
+            cat = None
+        print(f"   {cat or '—':<10} [{it['source']}] {it['title'][:90]}")
+        if not cat:
+            skipped += 1
             continue
-        uniq.append(it)
-    items = pending + uniq
-    print(f"{now:%H:%M} алерты: новых {len(fresh)}, про облигации {len(cand)}, к оценке {len(items)}")
-    if not items:
-        return
-    if not AI_ON:
-        print("⚠️ Нет ключа ИИ — алерты не классифицируются", file=sys.stderr)
-        return
-    sent = 0
-    for i in range(0, len(items), 8):
-        part = items[i:i + 8]
-        user = ("Уже было:\n" + "\n".join(f"- {t}" for t in recent[-30:]) + "\n\nНовости:\n\n" +
-                "\n\n".join(f"[{j}] ({x['source']}) {x['title']}\n{x['desc'][:500]}" for j, x in enumerate(part)))
-        res = extract_json(ask_ai(ALERT_PROMPT, user, max_tokens=500 * len(part) + 500, as_json=True))
-        if not isinstance(res, list):
-            for x in part:  # повторим в следующий раз (до 3 попыток)
-                x["tries"] = x.get("tries", 0) + 1
-                if x["tries"] < 3:
-                    state.setdefault("pending", []).append(x)
-            print("ИИ не ответил по пачке алертов — повтор позже", file=sys.stderr)
-            continue
-        for r in res:
-            try:
-                a = dict(part[int(r["i"])], **{k: v for k, v in r.items() if k != "i"})
-            except (KeyError, ValueError, IndexError, TypeError):
-                continue
-            state["recent"].append({"title": a["title"], "ts": now_ts})
-            cat = a.get("category")
-            print(f"   {cat or '?':<10} {'дубль' if a.get('dup') else ''} [{a['source']}] {a['title'][:80]}")
-            if a.get("dup") or cat not in CATEGORIES:
-                continue
-            if cat == "coupon":  # плановые купоны — в вечернюю сводку
-                state.setdefault("coupons", []).append({"title": a.get("title_ru") or a["title"], "link": a["link"]})
-                continue
-            send_text(CHATS, fmt_alert(a))
-            sent += 1
-            time.sleep(1.1)
-    print(f"   отправлено алертов: {sent}")
+        it["category"] = cat
+        recent.append(it["title"])
+        state["recent"].append({"title": it["title"], "ts": now_ts})
+        if cat == "report":
+            it["period"] = report_period(it["title"])
+        if CATEGORIES[cat][1]:
+            single.append(it)
+        else:
+            lists.setdefault(cat, []).append(it)
+    for a in single:
+        send_text(CHATS, fmt_alert(a))
+        time.sleep(0 if DRY_RUN else 1.1)
+    for cat in CATEGORIES:
+        if lists.get(cat):
+            send_text(CHATS, fmt_list(cat, lists[cat]))
+            time.sleep(0 if DRY_RUN else 1.1)
+    print(f"{now:%H:%M} алерты: новых {len(fresh)}, отдельных постов {len(single)}, "
+          f"в списках {sum(len(v) for v in lists.values())}, не про облигации {skipped}")
 
 
 # ───────────────────────── состояние и запуск ─────────────────────────
@@ -737,8 +842,15 @@ def load_state():
             st = json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
         st = {}
+    if DRY_RUN and not st:   # тест стартует с боевого состояния
+        try:
+            with open("bonds_state.json", encoding="utf-8") as f:
+                st = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            pass
     for k, v in (("seen", {}), ("feeds", []), ("recent", []), ("coupons", []), ("curve", {})):
         st.setdefault(k, v)
+    st.pop("pending", None)   # осталось от старой версии с ИИ
     return st
 
 
@@ -758,13 +870,13 @@ def report_due(state, now):
 
 
 def main():
-    if not bot.TOKEN or not CHATS:
+    if (not bot.TOKEN or not CHATS) and not DRY_RUN:
         sys.exit("Укажите TG_TOKEN и TG_CHAT_BONDS")
     state = load_state()
     now = datetime.now(LOCAL_TZ)
     if not state.get("started"):
         send_text(CHATS, "💼 <b>Bonds Alert подключён</b>\n\nСюда будут приходить: новые выпуски и размещения, "
-                  "отчётность эмитентов, дефолты и выкупы, рейтинги (KASE и AIX). "
+                  "купоны, отчётность эмитентов, дефолты и выкупы, рейтинги (KASE и AIX). "
                   f"По будням в {REPORT_TIME[0]}:{REPORT_TIME[1]:02d} — кривая ГЦБ, G-спреды и средние по секторам.")
         state["started"] = True
     try:

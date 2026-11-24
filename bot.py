@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Vitis News Bot v3 — новости по трём каналам: 🇰🇿 Vitis KZ · 🇰🇷 Vitis Korea · 🇺🇸 Vitis US
+Vitis News Bot v4 — новости по каналам: 🇰🇿 Vitis KZ · 🇰🇷 Vitis Korea · 🇺🇸 Vitis US · 🌍 Vitis Macro News
 
 Что умеет:
   • Делит новости по странам и шлёт каждую в свой канал
@@ -12,14 +12,16 @@ Vitis News Bot v3 — новости по трём каналам: 🇰🇿 Viti
 Без внешних библиотек, Python 3.9+.
   python bot.py --once         — одна проверка
   python bot.py --minutes 45   — проверять каждые INTERVAL_SEC в течение 45 минут (GitHub Actions)
+  DRY_RUN=1 python bot.py --once — тест без Telegram: посты печатаются в консоль, состояние в seen.dry.json
 
 Секреты:
   TG_TOKEN                     — токен бота (обязательно)
-  TG_CHAT_KZ / TG_CHAT_KR / TG_CHAT_US — каналы (@имя или -100...; можно несколько через запятую)
+  TG_CHAT_KZ / TG_CHAT_KR / TG_CHAT_US / TG_CHAT_MACRO — каналы (@имя или -100...; можно несколько через запятую)
                                  или темы одной группы: -100XXXXXXXXXX:номер_темы
   TG_CHAT_ID                   — личный чат для служебных сообщений; если канал не задан, его новости идут сюда
   GEMINI_API_KEY               — бесплатный ИИ (или ANTHROPIC_API_KEY — Claude)
 """
+import hashlib
 import html
 import json
 import os
@@ -60,8 +62,13 @@ WATCHLIST = {
     "MREK": ["mrek"],
 }
 
-MIN_SCORE = int(os.environ.get("MIN_SCORE", "3"))  # с какой оценки присылать сразу
-DROP_BELOW = 2                 # ниже — не присылать вообще
+# С какой оценки присылать сразу — отдельно по каналам (можно переопределить: MIN_SCORE_US=3 и т.п.)
+MIN_SCORE = {"US": 4, "KZ": 4, "KR": 3, "MACRO": 4}
+MIN_SCORE = {r: int(os.environ.get(f"MIN_SCORE_{r}") or v) for r, v in MIN_SCORE.items()}
+DROP_BELOW = 3                 # ниже — не присылать вообще (и в дайджест тоже)
+# Потолок постов в час на канал (🔴 5/5 проходят всегда); лишнее уходит в дайджест
+MAX_PER_HOUR = {"US": 8, "KR": 8, "KZ": 6, "MACRO": 6}
+MAX_AGE_HOURS = 36             # новости старше — не публикуем (старые страницы, всплывшие в лентах)
 QUIET_FROM, QUIET_TO = 23, 8   # тихие часы по Алматы
 DIGEST_HOURS = [8, 19]
 CALENDAR_REMIND_MIN = 60
@@ -72,6 +79,7 @@ REGIONS = {
     "KZ": {"flag": "🇰🇿", "name": "Vitis KZ", "env": "TG_CHAT_KZ"},
     "KR": {"flag": "🇰🇷", "name": "Vitis Korea", "env": "TG_CHAT_KR"},
     "US": {"flag": "🇺🇸", "name": "Vitis US", "env": "TG_CHAT_US"},
+    "MACRO": {"flag": "🌍", "name": "Vitis Macro News", "env": "TG_CHAT_MACRO"},
 }
 
 # Календарь Forex Factory: страна → канал (глобальная макро идёт в US)
@@ -98,8 +106,11 @@ PERSONAL = [c.strip() for c in os.environ.get("TG_CHAT_ID", "").split(",") if c.
 API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "")
 AI_ON = bool(GEMINI_KEY or API_KEY)
-INTERVAL = int(os.environ.get("INTERVAL_SEC", "300"))
-STATE_FILE = os.environ.get("STATE_FILE", "seen.json")
+INTERVAL = int(os.environ.get("INTERVAL_SEC", "120"))
+DRY_RUN = os.environ.get("DRY_RUN", "") not in ("", "0", "false")
+STATE_FILE = os.environ.get("STATE_FILE", "seen.dry.json" if DRY_RUN else "seen.json")
+SEC_UA = os.environ.get("SEC_UA", "")   # для SEC EDGAR нужен User-Agent вида "Имя email@домен"
+GNEWS_EVERY = 3        # ленты через Google News опрашиваем раз в 3 цикла (иначе Google режет запросы)
 MAX_PER_CYCLE = 150
 AI_CHUNK = 10          # маленькие пачки — ответ ИИ не обрезается
 MAX_AI_RETRIES = 3     # сколько раз пытаться оценить новость, если ИИ не ответил
@@ -109,6 +120,8 @@ DESC_LIMIT = 600
 def chats_for(region):
     raw = os.environ.get(REGIONS[region]["env"], "")
     ids = [c.strip() for c in raw.split(",") if c.strip()]
+    if DRY_RUN and not ids:
+        return [f"«{REGIONS[region]['name']}»"]
     return ids or PERSONAL
 
 
@@ -117,60 +130,75 @@ def gnews(query, lang="en", country="US"):
         {"q": query, "hl": f"{lang}-{country}", "gl": country, "ceid": f"{country}:{lang}"})
 
 
-# (название, канал по умолчанию, [адреса]). ИИ может перекинуть новость в другой канал,
-# если она про другую страну (напр. Reuters про Samsung → Korea).
+# (название, канал по умолчанию, [адреса], {необязательные фильтры}). ИИ может перекинуть новость
+# в другой канал, если она про другую страну (напр. Reuters про Samsung → Korea).
+# Фильтры: "must" — в заголовке/описании должно встретиться; "url" — в ссылке должно встретиться.
+KOREA_RE = r"korea|kospi|kosdaq|samsung|hynix|hyundai|\bkia\b|\blg\b|posco|\bwon\b|seoul|naver|kakao"
+KZ_RE = r"kazakh|казахстан|тенге|tenge|kaspi|kazatomprom|казатомпром|kazmunay|halyk|astana|tengiz|kashagan|\bcpc\b|ктк"
+GEO_RE = (r"\bwar\b|warfare|strike|missile|drone|sanction|ceasefire|truce|peace (talks|deal|plan)|troops|invasion|"
+          r"invade|nuclear|tariff|trade (war|deal)|export control|embargo|blockade|coup|martial law|"
+          r"election|summit|opec|iran|ukrain|russia|kremlin|israel|gaza|hezbollah|houthi|red sea|hormuz|"
+          r"taiwan|north korea|pyongyang|nato|\bg7\b|\bg20\b|санкци|войн|перемири|удар")
+MEGACAP_RE = (r"nvidia|apple inc|microsoft|alphabet|amazon|meta platforms|tesla|broadcom|"
+              r"advanced micro|intel corp|micron|berkshire|jpmorgan|coupang")
+
 FEEDS = [
-    # ─── 🇺🇸 US / глобальное ───
+    # ─── 🇺🇸 US / глобальное: только главные ленты ───
     ("Reuters", "US", [gnews("site:reuters.com (markets OR business OR economy OR stocks) when:1d")]),
     ("WSJ", "US", [
         "https://feeds.content.dowjones.io/public/rss/RSSMarketsMain",
         "https://feeds.content.dowjones.io/public/rss/WSJcomUSBusiness",
         "https://feeds.content.dowjones.io/public/rss/RSSWSJD",
-        gnews("site:wsj.com (markets OR economy OR business) when:1d"),
-    ]),
-    ("MarketWatch", "US", ["https://feeds.content.dowjones.io/public/rss/mw_topstories"]),
-    ("Yahoo Finance", "US", [
-        "https://finance.yahoo.com/rss/topstories",
-        "https://finance.yahoo.com/news/rss",
-        gnews("site:finance.yahoo.com when:1d"),
     ]),
     ("CNBC", "US", [
+        "https://www.cnbc.com/id/100003114/device/rss/rss.html",   # Top News
         "https://www.cnbc.com/id/20910258/device/rss/rss.html",
         "https://www.cnbc.com/id/15839069/device/rss/rss.html",
         "https://www.cnbc.com/id/10001147/device/rss/rss.html",
-        gnews("site:cnbc.com (markets OR economy OR stocks) when:1d"),
     ]),
-    ("Investing", "US", ["https://www.investing.com/rss/news.rss"]),
-    ("The Economist", "US", [
-        "https://www.economist.com/finance-and-economics/rss.xml",
-        "https://www.economist.com/business/rss.xml",
-    ]),
+    ("Investing", "US", ["https://www.investing.com/rss/news.rss"],
+     {"url": r"/news/(economy|economic-indicators|commodities-news|forex-news)"}),
+    # первоисточники — отсюда агентства берут новости, так быстрее всего
+    ("Fed", "US", ["https://www.federalreserve.gov/feeds/press_all.xml"]),
+    ("Nvidia IR", "US", ["https://nvidianews.nvidia.com/releases.xml"]),
+    ("SEC 8-K", "US", ["sec:https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=8-K&company=&dateb="
+                       "&owner=include&count=100&output=atom"], {"must": MEGACAP_RE}),
     # ─── 🇰🇷 Korea ───
     ("Yonhap", "KR", [
         "https://en.yna.co.kr/RSS/economy.xml",
         "https://en.yna.co.kr/RSS/market.xml",
-        gnews("site:en.yna.co.kr (economy OR market OR stocks OR company) when:1d"),
     ]),
     ("Korea Herald", "KR", [gnews("site:koreaherald.com (business OR economy OR market) when:1d")]),
     ("KED Global", "KR", [gnews("site:kedglobal.com when:1d")]),
     ("JoongAng Daily", "KR", [gnews("site:koreajoongangdaily.joins.com (business OR economy) when:1d")]),
     ("BusinessKorea", "KR", [gnews("site:businesskorea.co.kr when:1d")]),
-    ("SBS Biz", "KR", [gnews("site:biz.sbs.co.kr when:1d", "ko", "KR")]),
-    ("Reuters Korea", "KR", [gnews("site:reuters.com (Korea OR KOSPI OR Samsung OR Hynix OR Hyundai) when:1d")]),
-    ("CNBC Asia", "KR", ["https://www.cnbc.com/id/19832390/device/rss/rss.html"]),
+    ("Reuters Korea", "KR", [gnews("site:reuters.com (Korea OR KOSPI OR Samsung OR Hynix OR Hyundai) when:1d")],
+     {"must": KOREA_RE}),
+    ("CNBC Asia", "KR", ["https://www.cnbc.com/id/19832390/device/rss/rss.html"], {"must": KOREA_RE}),
     # ─── 🇰🇿 Kazakhstan ───
-    ("KASE", "KZ", [
-        "html:https://kase.kz/ru/information/news/all",
-        gnews("site:kase.kz when:2d", "ru", "KZ"),
-    ]),
-    ("AIX", "KZ", [
-        "https://aix.kz/feed/",
-        gnews("site:aix.kz when:3d"),
-    ]),
-    ("Kursiv", "KZ", ["https://kz.kursiv.media/feed/", gnews("site:kz.kursiv.media when:1d", "ru", "KZ")]),
-    ("Kapital.kz", "KZ", ["https://kapital.kz/rss", gnews("site:kapital.kz when:1d", "ru", "KZ")]),
-    ("Reuters KZ", "KZ", [gnews("site:reuters.com (Kazakhstan OR tenge OR Kazatomprom OR Kaspi) when:2d")]),
+    ("KASE", "KZ", ["html:https://kase.kz/ru/information/news/all"]),
+    ("AIX", "KZ", ["https://aix.kz/feed/"]),
+    ("Kursiv", "KZ", ["https://kz.kursiv.media/feed/"]),
+    ("Kapital.kz", "KZ", ["https://kapital.kz/rss"]),
+    ("Interfax KZ", "KZ", [gnews("site:interfax.kz when:1d", "ru", "KZ")]),
+    ("НБК", "KZ", [gnews("site:nationalbank.kz when:2d", "ru", "KZ")]),
+    ("Reuters KZ", "KZ", [gnews("site:reuters.com (Kazakhstan OR tenge OR Kazatomprom OR Kaspi) when:2d")],
+     {"must": KZ_RE}),
+    ("Bloomberg KZ", "KZ", [gnews("site:bloomberg.com (Kazakhstan OR Kazatomprom OR Kaspi OR Tengiz) when:2d")],
+     {"must": KZ_RE}),
+    # ─── 🌍 Macro / геополитика ───
+    ("Reuters World", "MACRO", [gnews("site:reuters.com (war OR sanctions OR ceasefire OR missile OR tariffs OR "
+                                      "Iran OR Ukraine OR Russia OR Taiwan OR OPEC) when:1d")], {"must": GEO_RE}),
+    ("AP", "MACRO", [gnews("site:apnews.com (war OR sanctions OR ceasefire OR Iran OR Ukraine OR Russia OR "
+                           "Taiwan OR tariffs) when:1d")], {"must": GEO_RE}),
+    ("BBC World", "MACRO", ["https://feeds.bbci.co.uk/news/world/rss.xml"], {"must": GEO_RE}),
+    ("Al Jazeera", "MACRO", ["https://www.aljazeera.com/xml/rss/all.xml"], {"must": GEO_RE}),
+    ("OFAC", "MACRO", [gnews("(site:home.treasury.gov OR site:ofac.treasury.gov) sanctions when:2d")]),
+    ("EU Council", "MACRO", [gnews("site:consilium.europa.eu sanctions when:2d")]),
 ]
+# Убраны как шум: Yahoo Finance (~650 записей в сутки: «цена акции онлайн», penny stocks, графики),
+# MarketWatch (личные финансы и мнения), The Economist (эссе, а не новости), SBS Biz (шортсы),
+# общий поток Investing (сделки инсайдеров) и дубли тех же сайтов через Google News.
 CALENDAR_URL = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
 
 # Отсекаются ещё до ИИ: рутина бирж и явно не-новости
@@ -185,7 +213,16 @@ SKIP_PATTERNS = [
     r"\bshould you (buy|sell)\b", r"\bbest (stocks?|etfs?|credit cards?)\b",
     r"\bretire(ment)?\b.*\b(save|savings|401\(k\)|social security)\b",
     r"\bmortgage rates? today\b", r"\bhoroscope\b",
+    # мусор, который реально проходил в ленту
+    r"\b(sells?|buys?|acquires?) \$[\d.,]+ ?[kmb]?(illion)? (in|of) .{0,40}(stock|shares)",
+    r"stock price .{0,20}real time", r"\bpenny stocks?\b", r"seasonal returns", r"price of (gold|silver) today",
+    r"top photos|photos of the (day|week)", r"\bstocks? to watch\b", r"\bbargain buys?\b",
+    r"биография", r"\d+ шаг\w+ к ", r"\[숏폼\]", r"price target|upgrades? .{0,30} to (buy|overweight)",
 ]
+# Биржевая рутина KASE: облигации, купоны, ГЦБ, репо — этим занимается bonds.py (тема Bonds Alert)
+KASE_ROUTINE = re.compile(r"облигац|купон|МЕУКАМ|МЕОКАМ|МЕККАМ|МЕУЖКАМ|нот\w* Национального Банка|подписк|"
+                          r"специализированные торги|репо|иностранными валютами|своп|паев|ETF|"
+                          r"маркет-мейкер|официальн\w+ списк", re.I)
 SKIP_URL = ["/personal-finance/", "/opinion/", "/opinions/", "/video/", "/videos/", "/sponsored",
             "/lifestyle/", "/sports/", "/podcast", "fool.com", "/live-blog", "/review/"]
 
@@ -194,7 +231,7 @@ UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
 
 SYSTEM_PROMPT = """Ты — редактор новостной ленты для портфельного аналитика инвестфонда в Алматы. \
 Она ведёт фонд корейских акций (Vitis Korea Fund) и следит за Казахстаном (KASE, AIX, тенге, \
-нефть, уран) и США/глобальными рынками (Fed, CPI, крупный тех).
+нефть, уран), США/глобальными рынками (Fed, CPI, крупный тех) и геополитикой (канал Macro).
 
 Нужны ТОЛЬКО НОВОСТИ про компании и макро: события, решения, отчёты, сделки, данные, \
 движения рынков. НЕ нужны: колонки и мнения, аналитические эссе и разборы «почему», \
@@ -203,27 +240,48 @@ SYSTEM_PROMPT = """Ты — редактор новостной ленты дл�
 фото и слухи о продуктах без финансового эффекта для компании.
 
 Для КАЖДОЙ новости верни объект JSON:
-- "i": номер
+- "i": идентификатор новости — ровно тот, что в квадратных скобках перед ней (напр. "k7q")
 - "kind": "company" (новость компании), "macro" (экономика, центробанки, данные, \
 политика с влиянием на экономику), "market" (движения индексов, валют, сырья, облигаций), \
+"geo" (геополитика: войны, удары, перемирия, санкции, торговые войны, перевороты, выборы), \
 или "other" (всё, что не новость — такое мы НЕ публикуем)
-- "region": о какой стране новость (не где опубликована!): "KZ" (Казахстан/Центральная Азия), \
-"KR" (Корея и корейские компании), "US" (США и всё глобальное). Казахстанский сайт про Hyundai → "KR"
-- "score": важность 1–5:
-   5 — двигает рынки сейчас: решение Fed/BoJ/BoK/НБК, неожиданные CPI/NFP, шок на рынке, \
-крупное событие по бумаге из watchlist
-   4 — важная макро-/отраслевая новость, отчёт крупной компании, заметное движение рынка
-   3 — полезная новость по её рынкам; любая заметная новость про крупный тех и ИИ \
-(Nvidia, AMD, TSMC, Apple, Microsoft, OpenAI, Anthropic…) — минимум 3; \
-KASE/AIX: IPO, дивиденды, индекс, отчёты эмитентов, остановка торгов бумагой — минимум 3
-   2 — второстепенное
+- "region": в какой канал (по содержанию, не по сайту!): \
+"MACRO" — геополитика и международная политика: войны и удары (Иран, Израиль, Россия/Украина, \
+Тайвань, КНДР), перемирия и переговоры, санкции и экспортный контроль, пошлины и торговые войны, \
+перевороты, выборы и смена власти в крупных странах, политические решения ОПЕК+; \
+"KZ" — Казахстан/Центральная Азия; "KR" — Корея и корейские компании; "US" — США и остальное \
+глобальное (ФРС, данные, компании). Казахстанский сайт про Hyundai → "KR"; санкции против РФ → "MACRO"
+- "score": важность 1–5. Оценивай СТРОГО: 4–5 получают считаные новости в день, большинство — 1–2.
+   5 — двигает рынки прямо сейчас: решение Fed/BoJ/BoK/НБК, неожиданные CPI/NFP, шок на рынке, \
+смена CEO или крупная сделка в мегакапе, начало/конец войны, удар по нефтяной инфраструктуре
+   4 — крупное событие масштаба страны или сектора
+   3 — заметная, но не срочная новость по её рынкам
+   2 — второстепенное, локальное, мелкие компании
    1 — шум
+  Масштаб по каналам:
+   US: 4+ только ФРС и ключевая статистика, отчёты и прогнозы мегакапов и крупного ИИ/чип-сектора \
+(Nvidia, AMD, TSMC, Apple, Microsoft, OpenAI, Anthropic…), смена CEO в них, M&A от $10 млрд, \
+движение индексов >1,5%. Средние и малые компании, рейтинги аналитиков, целевые цены, \
+продажи акций инсайдерами, «акции на заметку» — 1–2.
+   KZ: 4+ только масштаб страны: НБК и базовая ставка, инфляция, ВВП, бюджет, налоги, Нацфонд, тенге, \
+нефть/ОПЕК+/КТК/Тенгиз/Кашаган, уран, суверенный рейтинг, нацкомпании и бумаги watchlist \
+(отчёты, дивиденды, IPO/SPO), топ-5 банков, сделки и проекты от ~$100 млн (≈50 млрд ₸), \
+санкционные риски для Казахстана. Проекты и займы небольших компаний (меньше ~50 млрд ₸), \
+планы «построим к 2027», акиматы и регионы, льготные кредиты, биографии, криминал, назначения \
+ниже министра — 1–2.
+   KR: 4+ — Банк Кореи, экспорт/ВВП/инфляция, вона, отчёты и крупные решения Samsung, SK Hynix, \
+Hyundai и других тяжеловесов KOSPI, чипы, потоки иностранцев, реформы рынка (Value-up, налоги). \
+Личные дела владельцев чеболей — 3 и только если затрагивают контроль или пакет акций. \
+Общество, спорт, внутренняя политика без влияния на рынок — 1.
+   MACRO: 4+ — эскалация или деэскалация с эффектом для нефти, валют, рынков: новые удары и фронты, \
+перемирие, новые пакеты санкций, пошлины. Рутинные сводки с фронта, заявления без действий — 2.
 - "title_ru": заголовок по-русски, коротко и по делу, как в новостном агентстве (до 110 знаков)
 - "summary": суть по-русски, 2–3 коротких предложения: что произошло, ключевые цифры, контекст. \
 Только факты из текста, без воды
 - "why": ПОЧЕМУ ЭТО ВАЖНО — одно короткое предложение по-русски: какой механизм и для каких \
 активов, В КОНТЕКСТЕ РЫНКА САМОЙ НОВОСТИ (новость про США — последствия для американских \
-компаний, сектора, индексов, ставок; про Корею — для корейских; про Казахстан — для казахстанских). \
+компаний, сектора, индексов, ставок; про Корею — для корейских; про Казахстан — для казахстанских; \
+геополитика — для нефти, золота, доллара, рисковых активов). \
 Упоминай другие страны и компании, только если связь прямая и названа в тексте \
 (напр. в новости сказано, что Samsung поставляет чипы). Без общих фраз вроде «это важно для рынка»
 - "impact": на что влияет, коротко, с ▲/▼ если ясно направление (напр. "KOSPI ▲, USD/KRW ▼"), или ""
@@ -236,18 +294,27 @@ Watchlist: {watchlist}
 
 Ответь ТОЛЬКО массивом JSON."""
 
-KIND_LABEL = {"company": "🏢 Компании", "macro": "🏛 Макро", "market": "📊 Рынки"}
+KIND_LABEL = {"company": "🏢 Компании", "macro": "🏛 Макро", "market": "📊 Рынки", "geo": "🌍 Геополитика"}
 
 
 # ───────────────────────── сеть ─────────────────────────
 
 def fetch(url, timeout=20):
-    req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "*/*"})
+    ua = SEC_UA if "sec.gov" in url and SEC_UA else UA
+    req = urllib.request.Request(url, headers={"User-Agent": ua, "Accept": "*/*"})
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return r.read()
 
 
 def tg(method, params, retry=True):
+    if DRY_RUN:  # тест без Telegram: печатаем то, что ушло бы в канал
+        body = params.get("text") or params.get("caption") or ""
+        body = html.unescape(re.sub(r"<[^>]+>", "", re.sub(r'<a href="([^"]+)">([^<]*)</a>', r"\2 <\1>", body)))
+        print(f"\n┌── {method} → {params.get('chat_id')}"
+              + (f" (тема {params['message_thread_id']})" if params.get("message_thread_id") else "")
+              + (f"  [фото: {params['photo'][:60]}]" if params.get("photo") else "")
+              + "\n" + "\n".join("│ " + l for l in body.split("\n")) + "\n└──")
+        return {"ok": True}
     data = urllib.parse.urlencode(params).encode()
     req = urllib.request.Request(f"https://api.telegram.org/bot{TOKEN}/{method}", data=data)
     try:
@@ -363,10 +430,11 @@ def ask_claude(system, user, max_tokens):
 
 
 def ask_ai(system, user, max_tokens=4000, as_json=False):
-    """Gemini (бесплатно), если задан GEMINI_API_KEY, иначе Claude."""
-    if GEMINI_KEY:
-        return ask_gemini(system, user, max_tokens, as_json)
-    return ask_claude(system, user, max_tokens)
+    """Gemini (бесплатно), если задан GEMINI_API_KEY; если он не ответил (лимит) — Claude, если есть ключ."""
+    out = ask_gemini(system, user, max_tokens, as_json) if GEMINI_KEY else None
+    if not out and API_KEY:
+        out = ask_claude(system, user, max_tokens)
+    return out
 
 
 # ───────────────────────── разбор лент ─────────────────────────
@@ -555,11 +623,54 @@ def extract_json(text):
         return None
 
 
-def score_items(items, recent_titles):
-    out = []
-    for i in range(0, len(items), AI_CHUNK):
-        out += score_chunk(items[i:i + AI_CHUNK], recent_titles + [x["title"] for x in out])
-    return out
+BREAK_EVENT = re.compile(
+    r"\b(resign\w*|steps? down|stepping down|oust\w*|fired|reinstat\w*|returns? as (ceo|chief)|named (ceo|chief)|"
+    r"new ceo|appoint\w* (as )?(ceo|chief)|to acquire|agrees? to (buy|acquire)|merger|takeover|bankruptcy|"
+    r"chapter 11|halts? trading|trading halt\w*|circuit breaker|emergency (rate|meeting)|rate (cut|hike)|"
+    r"(cuts?|raises?|hikes?|holds?) (interest )?rates?|defaults?|invad\w+|invasion|declares? war|ceasefire|"
+    r"truce|missile|air ?strikes?|strikes? on|sanctions?|martial law|coup|assassinat\w+|plunge\w*|crash\w*|"
+    r"soars?|tariffs?)\b|отставк|уволен|назначен\w* (глав|председател)|дефолт|девальвац|базов\w+ ставк|"
+    r"санкци|перемири|удар\w* по|военное положение", re.I)
+BREAK_ENTITY = re.compile(
+    r"\b(nvidia|apple|microsoft|alphabet|google|amazon|meta|tesla|tsmc|openai|anthropic|broadcom|amd|intel|"
+    r"samsung|hynix|hyundai|fed|fomc|powell|ecb|boj|bank of korea|bok|kospi|s&p 500|nasdaq|iran|israel|"
+    r"russia|ukraine|china|taiwan|north korea|opec|trump|white house|kaspi|halyk|kazatomprom|kazmunaygas)\b|"
+    r"нбк|нацбанк|казатомпром|казмунайгаз|тенге|иран|росси|украин|кита|опек", re.I)
+
+
+HARD_EVENT = re.compile(
+    r"\b(resign\w*|steps? down|stepping down|oust\w*|fired|reinstat\w*|returns? as (ceo|chief)|named (ceo|chief)|"
+    r"new ceo|appoint\w* (as )?(ceo|chief)|to acquire|agrees? to (buy|acquire)|bankruptcy|chapter 11|"
+    r"trading halt\w*|circuit breaker|emergency (rate|meeting)|(cuts?|raises?|hikes?) (interest )?rates?|"
+    r"invad\w+|invasion|declares? war|ceasefire|martial law|coup|assassinat\w+)\b|"
+    r"отставк|дефолт|девальвац|(повысил|снизил|сохранил)\w* базов\w+ ставк|перемири|военное положение", re.I)
+
+
+def is_hard_breaking(it):
+    """Узкий список событий, которые публикуем даже без ИИ (оригинальным заголовком)."""
+    return bool(HARD_EVENT.search(it["title"]) and BREAK_ENTITY.search(it["title"])) and not is_junk(it)
+
+
+def is_breaking(it):
+    """Похоже на срочное: такие новости оцениваются первыми и уходят, не дожидаясь остальных."""
+    text = f"{it['title']} {it.get('desc', '')[:200]}"
+    return bool(BREAK_EVENT.search(text) and BREAK_ENTITY.search(text))
+
+
+def plausible(it, r):
+    """Ответ ИИ действительно про эту новость? Защита от перепутанных номеров (чужой текст → чужая ссылка)."""
+    src = f"{it['title']} {it['desc']}".lower().replace(",", ".")
+    title_ru = str(r.get("title_ru") or "").lower().replace(",", ".")
+    if not title_ru:
+        return True
+    tokens = set(re.findall(r"[a-z]{3,}|\d+(?:\.\d+)?", title_ru))
+    if tokens and not any(t in src for t in tokens):
+        return False
+    stems = {w[:5] for w in re.findall(r"[а-яё]{5,}", src)}
+    if len(stems) >= 3:  # русский источник: должны совпасть хоть какие-то слова
+        out = f"{title_ru} {str(r.get('summary') or '').lower()}"
+        return bool(stems & {w[:5] for w in re.findall(r"[а-яё]{5,}", out)})
+    return True
 
 
 def score_chunk(items, recent_titles):
@@ -569,7 +680,13 @@ def score_chunk(items, recent_titles):
                   dup=False, ai=False)
     if not AI_ON or not items:
         return items
-    lines = [f"[{i}] ({it['source']}) {it['title']}\n{it['desc'][:DESC_LIMIT]}" for i, it in enumerate(items)]
+    # у каждой новости свой короткий код, а не порядковый номер: если ИИ собьётся со счёта,
+    # ответ не «переедет» на соседнюю новость
+    by_id = {}
+    for n, it in enumerate(items):
+        code = hashlib.sha1(it["link"].encode()).hexdigest()[:4]
+        by_id[code if code not in by_id else f"{code}{n}"] = it
+    lines = [f"[{code}] ({it['source']}) {it['title']}\n{it['desc'][:DESC_LIMIT]}" for code, it in by_id.items()]
     recent = "\n".join(f"- {t}" for t in recent_titles[-40:]) or "(пусто)"
     user = f"Недавно отправлено:\n{recent}\n\nНовые новости:\n\n" + "\n\n".join(lines)
     system = SYSTEM_PROMPT.replace("{watchlist}", ", ".join(WATCHLIST))
@@ -581,10 +698,18 @@ def score_chunk(items, recent_titles):
         print(f"ИИ не оценил: {items[0]['title'][:60]}", file=sys.stderr)
         return items
     for r in result:
+        if not isinstance(r, dict):
+            continue
+        it = by_id.get(str(r.get("i", "")).strip("[] "))
+        if it is None:
+            continue
+        if not plausible(it, r):
+            print(f"ИИ перепутал новости — «{str(r.get('title_ru'))[:50]}» не про «{it['title'][:50]}»; повтор",
+                  file=sys.stderr)
+            continue
         try:
-            it = items[int(r["i"])]
             it["score"] = max(1, min(5, int(r.get("score", it["score"]))))
-        except (KeyError, ValueError, IndexError, TypeError):
+        except (ValueError, TypeError):
             continue
         it["kind"] = str(r.get("kind") or "")
         if r.get("region") in REGIONS:
@@ -623,7 +748,7 @@ def importance(score):
 def format_post(it):
     title = it.get("title_ru") or it["title"]
     head = f"{REGIONS[it['region']]['flag']} <b>{esc(title)}</b>"
-    meta = [importance(it["score"])]
+    meta = ["⚡️ Срочно · без перевода" if it.get("raw") else importance(it["score"])]
     if KIND_LABEL.get(it.get("kind")):
         meta.append(KIND_LABEL[it["kind"]])
     if it["watch"]:
@@ -747,7 +872,7 @@ def send_digest(state, now, region):
         if brief:
             parts.append("<b>Главное</b>\n<blockquote>" + esc(brief.strip()) + "</blockquote>")
     lines = [f'{"📌 " if q.get("watch") else "▫️ "}<a href="{html.escape(q["link"])}">{esc(q["title"])}</a>'
-             for q in queue[:25]]
+             for q in queue[:15]]
     parts.append("<b>Все новости</b>\n" + "\n".join(lines))
     if cal:
         parts.append(cal)
@@ -765,33 +890,59 @@ def maybe_digest(state, now):
 
 # ───────────────────────── состояние ─────────────────────────
 
+def skey(source, uid):
+    """Короткий ключ «уже видели» (хэш вместо длинной ссылки — файл состояния в разы меньше)."""
+    return hashlib.sha1(f"{source}|{uid}".encode()).hexdigest()[:14]
+
+
 def load_state():
-    try:
-        with open(STATE_FILE, encoding="utf-8") as f:
-            st = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        st = {}
+    st = {}
+    for path in ([STATE_FILE, "seen.json"] if DRY_RUN else [STATE_FILE]):  # тест стартует с боевого состояния
+        try:
+            with open(path, encoding="utf-8") as f:
+                st = json.load(f)
+            break
+        except (FileNotFoundError, json.JSONDecodeError):
+            pass
     for k, v in (("seen", {}), ("feeds", []), ("recent", []), ("queue", []),
-                 ("digests", []), ("calendar", {})):
+                 ("digests", []), ("calendar", {}), ("sent_log", [])):
         st.setdefault(k, v)
+    if any(not re.fullmatch(r"[0-9a-f]{14}", k) for k in list(st["seen"])[:50]):  # старый формат ключей
+        st["seen"] = {(k if re.fullmatch(r"[0-9a-f]{14}", k) else hashlib.sha1(k.encode()).hexdigest()[:14]): v
+                      for k, v in st["seen"].items()}
     return st
 
 
 def save_state(state):
-    if len(state["seen"]) > 8000:
-        state["seen"] = dict(sorted(state["seen"].items(), key=lambda kv: kv[1])[-8000:])
+    # вытесняем по времени, когда запись ПОСЛЕДНИЙ раз была в ленте (см. check_news), — иначе старые
+    # статьи, которые ещё висят в ленте, через пару дней считались новыми и публиковались повторно
+    if len(state["seen"]) > 20000:
+        state["seen"] = dict(sorted(state["seen"].items(), key=lambda kv: kv[1])[-20000:])
     cutoff = int(time.time()) - 48 * 3600
     state["recent"] = [r for r in state["recent"] if r["ts"] > cutoff][-400:]
     state["queue"] = state["queue"][-300:]
+    state["sent_log"] = [x for x in state["sent_log"] if x[0] > time.time() - 3600]
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False)
 
 
 # ───────────────────────── основной цикл ─────────────────────────
 
-def load_source(urls):
-    items, errors, links, titles = [], [], set(), set()
+_cycle = {"n": 0}
+SAMPLE = int(sys.argv[sys.argv.index("--sample") + 1]) if "--sample" in sys.argv else 0
+
+
+def load_source(urls, with_gnews=True):
+    """→ (новости, ошибки, сколько адресов опрошено)."""
+    items, errors, links, titles, tried = [], [], set(), set(), 0
     for url in urls:
+        if "news.google.com" in url and not with_gnews:
+            continue
+        if url.startswith("sec:"):
+            if not SEC_UA:
+                continue
+            url = url[4:]
+        tried += 1
         try:
             got = (parse_html_news(fetch(url[5:]), url[5:]) if url.startswith("html:")
                    else parse_feed(fetch(url)))
@@ -804,29 +955,48 @@ def load_source(urls):
                 continue
             links.add(it["link"]); titles.add(tkey)
             items.append(it)
-    return items, errors
+    return items, errors, tried
 
 
 def check_news(state, now):
     now_ts = int(now.timestamp())
-    fresh = []
-    for source, region, urls in FEEDS:
-        items, errors = load_source(urls)
+    _cycle["n"] += 1
+    with_gnews = _cycle["n"] % GNEWS_EVERY == 1 or GNEWS_EVERY <= 1
+    with ThreadPoolExecutor(12) as ex:  # все ленты параллельно — цикл занимает секунды, а не минуты
+        loaded = list(ex.map(lambda f: load_source(f[2], with_gnews), FEEDS))
+    fresh, log = [], []
+    for (source, region, urls, *rest), (items, errors, tried) in zip(FEEDS, loaded):
+        opts = rest[0] if rest else {}
         if errors:
             print(f"[{source}] часть адресов не ответила: {'; '.join(errors)}", file=sys.stderr)
         if not items:
-            print(f"[{source}] не загрузился", file=sys.stderr)
+            if tried:
+                print(f"[{source}] не загрузился", file=sys.stderr)
             continue
         first_time = source not in state["feeds"]
+        if SAMPLE:  # тестовый режим: берём N свежих из каждой ленты, даже если уже видели
+            items = sorted(items, key=lambda x: x["ts"] or 0)[-SAMPLE:]
         for it in items:
-            key = f"{source}|{it['id']}"
-            if key in state["seen"]:
+            key = skey(source, it["id"])
+            known = key in state["seen"]
+            state["seen"][key] = now_ts          # обновляем метку, пока запись есть в ленте
+            if (known or first_time) and not SAMPLE:
                 continue
-            state["seen"][key] = now_ts
-            if not first_time:
-                it["source"], it["region"] = source, region
+            it["source"], it["region"] = source, region
+            text = f"{it['title']} {it['desc'][:300]}"
+            if it["ts"] and now_ts - it["ts"] > MAX_AGE_HOURS * 3600:
+                log.append(("   ", "старая (фильтр)", it))
+            elif len(it["title"]) < 15:
+                pass
+            elif opts.get("must") and not re.search(opts["must"], text, re.I):
+                log.append(("   ", "не по теме ленты", it))
+            elif opts.get("url") and not re.search(opts["url"], it["link"], re.I):
+                log.append(("   ", "не тот раздел", it))
+            elif source == "KASE" and KASE_ROUTINE.search(it["title"]):
+                log.append(("   ", "→ Bonds (bonds.py)", it))
+            else:
                 fresh.append(it)
-        if first_time:
+        if first_time and not SAMPLE:
             state["feeds"].append(source)
             state["recent"] += [{"title": it["title"], "ts": now_ts} for it in items[:30]]
             print(f"[{source}] подключён, в ленте {len(items)} новостей")
@@ -837,7 +1007,6 @@ def check_news(state, now):
         print(f"{now:%H:%M} новых нет")
         return
 
-    log = []
     junk = [it for it in fresh if is_junk(it)]
     fresh = [it for it in fresh if it not in junk]
     log += [("   ", "не новость (фильтр)", it) for it in junk]
@@ -854,67 +1023,84 @@ def check_news(state, now):
         unique.append(it)
 
     # новости, которые ИИ не смог оценить в прошлый раз, — ещё одна попытка
-    pending = state.pop("pending", [])
-    unique = pending + unique
-    scored = score_items(unique, recent_titles)
-    to_send = []
+    todo = [it for it in state.pop("pending", []) if not is_junk(it)] + unique
+    for it in todo:
+        it["prio"] = is_breaking(it)
+    todo.sort(key=lambda x: (not x["prio"], x.get("ts") or 0))   # срочные — первыми
     quiet = in_quiet(now)
-    for it in scored:
+    sent = {r: 0 for r in REGIONS}
+    all_ai = True
+
+    def queue(it, summary=None):
+        state["queue"].append({"title": it.get("title_ru") or it["title"], "link": it["link"],
+                               "score": it["score"], "summary": it["summary"] if summary is None else summary,
+                               "watch": it["watch"], "ts": it["ts"], "source": it["source"], "region": it["region"]})
+
+    def route(it):
+        """Куда новость: вернуть True — отправить сейчас."""
+        nonlocal all_ai
         if AI_ON and not it.get("ai"):
+            all_ai = False
+            if is_hard_breaking(it):   # срочное не ждёт ИИ: шлём оригинальный заголовок
+                it.update(raw=True, score=4)
+                state["recent"].append({"title": it["title"], "ts": now_ts})
+                log.append(("4/5", f"⚡️ без ИИ → {it['region']}", it))
+                return True
             it["tries"] = it.get("tries", 0) + 1
             if it["tries"] < MAX_AI_RETRIES:
                 state.setdefault("pending", []).append(
                     {k: it[k] for k in ("id", "title", "link", "desc", "image", "ts", "source", "region", "tries")})
                 log.append(("   ", "ждёт ИИ (повтор)", it))
-                continue
-            # ИИ так и не ответил — не публикуем «сырой» пост, только в дайджест
-            state["queue"].append({"title": it["title"], "link": it["link"], "score": it["score"],
-                                   "summary": "", "watch": it["watch"], "ts": it["ts"],
-                                   "source": it["source"], "region": it["region"]})
-            log.append(("   ", "без ИИ → дайджест", it))
-            continue
+            else:
+                log.append(("   ", "без ИИ — отброшено", it))
+            return False
         state["recent"].append({"title": it["title"], "ts": now_ts})
         if it.get("title_ru"):
             state["recent"].append({"title": it["title_ru"], "ts": now_ts})
-        sc = f"{it['score']}/5"
+        sc, reg = f"{it['score']}/5", it["region"]
         if it["dup"]:
-            log.append((sc, "ДУБЛЬ (ИИ)", it)); continue
+            log.append((sc, "ДУБЛЬ (ИИ)", it)); return False
         if it.get("kind") == "other":
-            log.append((sc, "не новость (ИИ)", it)); continue
+            log.append((sc, "не новость (ИИ)", it)); return False
         if it["score"] < DROP_BELOW:
-            log.append((sc, "отброшено", it)); continue
-        if it["score"] >= MIN_SCORE and (not quiet or it["score"] == 5):
-            to_send.append(it)
-            log.append((sc, f"→ {it['region']}", it))
-        else:
-            state["queue"].append({"title": it.get("title_ru") or it["title"], "link": it["link"],
-                                   "score": it["score"], "summary": it["summary"], "watch": it["watch"],
-                                   "ts": it["ts"], "source": it["source"], "region": it["region"]})
-            log.append((sc, f"в дайджест {it['region']}", it))
+            log.append((sc, "отброшено", it)); return False
+        hour = sum(1 for t, r in state["sent_log"] if r == reg and t > now_ts - 3600)
+        ok = it["score"] >= MIN_SCORE[reg] and (not quiet or it["score"] == 5 or (it["prio"] and it["score"] >= 4))
+        if ok and it["score"] < 5 and hour >= MAX_PER_HOUR[reg]:
+            queue(it); log.append((sc, f"лимит в час → дайджест {reg}", it)); return False
+        if ok:
+            state["sent_log"].append([now_ts, reg]); sent[reg] += 1
+            log.append((sc, f"→ {reg}", it)); return True
+        queue(it); log.append((sc, f"в дайджест {reg}", it))
+        return False
 
-    # картинки для тех, что отправляем
     def add_image(it):
         if not it.get("image"):
             it["image"] = page_meta(it["link"])[1]
         return it
-    if SEND_IMAGES:
-        with ThreadPoolExecutor(8) as ex:
-            to_send = list(ex.map(add_image, to_send))
-    for it in to_send:
-        send_post(chats_for(it["region"]), format_post(it), it.get("image"))
-        time.sleep(1.1)
+
+    # оцениваем пачками и СРАЗУ отправляем каждую пачку — срочное не ждёт, пока ИИ разберёт всё остальное
+    for i in range(0, len(todo), AI_CHUNK):
+        chunk = score_chunk(todo[i:i + AI_CHUNK], recent_titles)
+        to_send = [it for it in chunk if route(it)]
+        recent_titles += [it["title"] for it in chunk if it.get("ai")]
+        if SEND_IMAGES and to_send:
+            with ThreadPoolExecutor(8) as ex:
+                to_send = list(ex.map(add_image, to_send))
+        for it in to_send:
+            send_post(chats_for(it["region"]), format_post(it), it.get("image"))
+            time.sleep(0 if DRY_RUN else 1.1)
+        save_state(state)
 
     print("─" * 70)
     for sc, what, it in sorted(log, key=lambda x: x[0], reverse=True):
-        print(f"{sc}  {what:<20} [{it['source']}] {(it.get('title_ru') or it['title'])[:85]}")
+        print(f"{sc}  {what:<26} [{it['source']}] {(it.get('title_ru') or it['title'])[:85]}")
     print("─" * 70)
-    if AI_ON and scored and not all(x.get("ai") for x in scored):
+    if AI_ON and not all_ai:
         print("⚠️ ИИ ответил не на все новости — они попробуются ещё раз (см. ошибки Gemini выше)")
     elif not AI_ON:
         print("⚠️ Ключ ИИ не задан — оценка по ключевым словам")
-    by_reg = {r: sum(1 for it in to_send if it["region"] == r) for r in REGIONS}
-    print(f"{now:%H:%M} новых {len(fresh) + len(junk)}, отправлено "
-          + ", ".join(f"{r} {n}" for r, n in by_reg.items()))
+    print(f"{now:%H:%M} новых {len(todo) + len(junk)}, отправлено " + ", ".join(f"{r} {n}" for r, n in sent.items()))
 
 
 def run_once(state):
@@ -928,10 +1114,12 @@ def run_once(state):
 
 
 def main():
-    if not TOKEN:
+    if not TOKEN and not DRY_RUN:
         sys.exit("Укажите TG_TOKEN")
+    if DRY_RUN:
+        print(f"🧪 DRY_RUN: в Telegram ничего не уходит, состояние пишется в {STATE_FILE}")
     missing = [r for r in REGIONS if not os.environ.get(REGIONS[r]["env"])]
-    if missing and not PERSONAL:
+    if missing and not PERSONAL and not DRY_RUN:
         sys.exit("Укажите каналы TG_CHAT_KZ/KR/US или хотя бы TG_CHAT_ID")
     if not AI_ON:
         print("Ключ ИИ не задан — оценка по ключевым словам, без перевода", file=sys.stderr)
@@ -948,6 +1136,16 @@ def main():
                 if missing else "")
              + ("" if AI_ON else "\n⚠️ Ключ ИИ не задан — без перевода и оценки."))
         state["v3"] = True
+    if not state.get("v4"):
+        state["queue"] = [q for q in state["queue"] if q.get("score", 0) >= DROP_BELOW]  # старый «фон» не нужен
+        state.pop("v2", None)
+    if not state.get("v4") and not DRY_RUN:
+        if os.environ.get("TG_CHAT_MACRO"):
+            send_text(chats_for("MACRO"), "🌍 <b>Vitis Macro News</b> подключён\n\nСюда будет приходить геополитика: "
+                      "войны и удары, перемирия, санкции, пошлины, смена власти — то, что двигает нефть, валюты и рынки.")
+        else:
+            send("⚠️ Не задан секрет TG_CHAT_MACRO — геополитика пока идёт сюда, в личку.")
+        state["v4"] = True
     minutes = None
     if "--minutes" in sys.argv:
         minutes = int(sys.argv[sys.argv.index("--minutes") + 1])
