@@ -423,7 +423,7 @@ def send(text):  # служебные сообщения — в личку
 
 # Как просить модель «не размышлять» (размышления съедают лимит ответа): у Gemini 3.x это
 # thinkingLevel, у 2.x — thinkingBudget; если модель не принимает ни то ни другое — без параметра.
-THINK_MODES = [{"thinkingLevel": "minimal"}, {"thinkingBudget": 0}, None]
+THINK_MODES = [{"thinkingLevel": "minimal"}, {"thinkingLevel": "low"}, {"thinkingBudget": 0}, None]
 _gemini_state = {"model": 0, "mode": {}}
 
 
@@ -433,7 +433,7 @@ def ask_gemini(system, user, max_tokens, as_json):
             _gemini_state["model"] = 0
             return None
         model = GEMINI_MODELS[_gemini_state["model"]]
-        mode_i = _gemini_state["mode"].setdefault(model, 1 if "-2." in model else 0)
+        mode_i = _gemini_state["mode"].setdefault(model, 2 if "-2." in model else 0)
         think = THINK_MODES[mode_i]
         # без явного отключения размышлений даём запас по длине ответа
         cfg = {"maxOutputTokens": max_tokens if think else max_tokens * 3, "temperature": 0.2}
@@ -748,7 +748,7 @@ def plausible(it, r, others=()):
         return True
     if len({w[:5] for w in re.findall(r"[а-яё]{5,}", f"{it['title']} {it['desc']}".lower())}) >= 3:
         return False   # русский источник и ни одного общего слова
-    return not any(_overlap(o, out) >= 2 for o in others if o is not it)
+    return not any(_overlap(o, out) >= 4 for o in others if o is not it)
 
 
 def score_chunk(items, recent_titles):
@@ -1330,7 +1330,8 @@ def check_news(state, now):
     with ThreadPoolExecutor(8) as ex:
         fresh = list(ex.map(tidy, fresh))
 
-    recent_titles = [r["title"] for r in state["recent"]]
+    # в тесте (--sample) новости берутся повторно, поэтому с уже обработанными не сверяем — иначе всё «дубль»
+    recent_titles = [] if SAMPLE else [r["title"] for r in state["recent"]]
     unique = []
     for it in fresh:
         if any(similar(it["title"], t) for t in recent_titles + [u["title"] for u in unique]):
@@ -1339,7 +1340,7 @@ def check_news(state, now):
         unique.append(it)
 
     # новости, которые ИИ не смог оценить в прошлый раз, — ещё одна попытка
-    todo = [it for it in state.pop("pending", []) if not is_junk(it)] + unique
+    todo = [it for it in state.pop("pending", []) if not is_junk(it) and len(it["title"]) >= 15] + unique
     for it in todo:
         it["prio"] = is_breaking(it)
     todo.sort(key=lambda x: (not x["prio"], x.get("ts") or 0))   # срочные — первыми
@@ -1487,6 +1488,13 @@ def main():
     stop_at = time.time() + (minutes or 0) * 60
     while True:
         run_once(state)
+        if DRY_RUN:   # в тесте сразу показываем и утренние сводки с радаром — отдельная галочка не нужна
+            print("\n" + "═" * 25 + " УТРЕННИЕ СВОДКИ И РАДАР (как придут в 9:00) " + "═" * 25)
+            for reg in ACTIVE:
+                try:
+                    send_digest(state, datetime.now(LOCAL_TZ), reg, brief=True)
+                except Exception as e:
+                    print(f"Сводка {reg} не отправлена: {e!r}", file=sys.stderr)
         if "--once" in sys.argv or (minutes is not None and time.time() + INTERVAL > stop_at):
             break
         time.sleep(INTERVAL)
