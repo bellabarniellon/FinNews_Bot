@@ -2,14 +2,22 @@ name: news-bot
 
 on:
   schedule:
-    - cron: "*/30 * * * *"   # запуск каждые ~30 мин; внутри бот сам проверяет новости каждые 5 мин
+    - cron: "*/15 * * * *"   # запуски идут цепочкой без пауз; внутри бот проверяет ленты каждые 2 мин
   workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Тест без Telegram: посты только в лог запуска"
+        type: boolean
+        default: false
+      sample:
+        description: "Для теста: взять N свежих новостей из каждой ленты (0 — только новые)"
+        default: "0"
 
 permissions:
   contents: write
 
 concurrency:
-  group: news-bot
+  group: news-bot${{ inputs.dry_run && '-dry' || '' }}   # тест не ждёт очереди за боевым запуском
   cancel-in-progress: false
 
 jobs:
@@ -22,21 +30,32 @@ jobs:
         with:
           python-version: "3.12"
       - name: Check news
-        run: python bot.py --minutes 45
+        run: >
+          python bot.py
+          ${{ inputs.dry_run && '--once' || '--minutes 50' }}
+          ${{ inputs.dry_run && inputs.sample != '0' && format('--sample {0}', inputs.sample) || '' }}
         env:
+          DRY_RUN: ${{ inputs.dry_run && '1' || '' }}
           TG_TOKEN: ${{ secrets.TG_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           TG_CHAT_KZ: ${{ secrets.TG_CHAT_KZ }}
           TG_CHAT_KR: ${{ secrets.TG_CHAT_KR }}
           TG_CHAT_US: ${{ secrets.TG_CHAT_US }}
+          TG_CHAT_MACRO: ${{ secrets.TG_CHAT_MACRO }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          MIN_SCORE: ${{ vars.MIN_SCORE || '3' }}
-          INTERVAL_SEC: "300"
+          SEC_UA: ${{ vars.SEC_UA }}
+          MIN_SCORE_US: ${{ vars.MIN_SCORE_US }}
+          MIN_SCORE_KZ: ${{ vars.MIN_SCORE_KZ }}
+          MIN_SCORE_KR: ${{ vars.MIN_SCORE_KR }}
+          MIN_SCORE_MACRO: ${{ vars.MIN_SCORE_MACRO }}
+          INTERVAL_SEC: "120"
       - name: Save state
-        if: always()
+        if: ${{ always() && !inputs.dry_run }}
         run: |
           git config user.name "news-bot"
           git config user.email "news-bot@users.noreply.github.com"
           git add seen.json
-          git diff --cached --quiet || (git commit -m "update seen" && git pull --rebase && git push)
+          git diff --cached --quiet && exit 0
+          git commit -m "update seen"
+          for i in 1 2 3; do git pull --rebase && git push && break; sleep 5; done
