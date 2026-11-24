@@ -63,11 +63,11 @@ WATCHLIST = {
 }
 
 # С какой оценки присылать сразу — отдельно по каналам (можно переопределить: MIN_SCORE_US=3 и т.п.)
-MIN_SCORE = {"US": 4, "KZ": 3, "KR": 3, "MACRO": 4, "CRYPTO": 3}
+MIN_SCORE = {"US": 4, "KZ": 3, "KR": 3, "MACRO": 4, "CRYPTO": 3, "OPINION": 3}
 MIN_SCORE = {r: int(os.environ.get(f"MIN_SCORE_{r}") or v) for r, v in MIN_SCORE.items()}
 DROP_BELOW = 3                 # ниже — не присылать вообще (и в дайджест тоже)
 # Потолок постов в час на канал (🔴 5/5 проходят всегда); лишнее уходит в дайджест
-MAX_PER_HOUR = {"US": 8, "KR": 8, "KZ": 6, "MACRO": 6, "CRYPTO": 5}
+MAX_PER_HOUR = {"US": 8, "KR": 8, "KZ": 6, "MACRO": 6, "CRYPTO": 5, "OPINION": 4}
 MAX_AGE_HOURS = 36             # новости старше — не публикуем (старые страницы, всплывшие в лентах)
 QUIET_FROM, QUIET_TO = 23, 8   # тихие часы по Алматы
 DIGEST_HOURS = [9, 19]         # 9:00 — утренняя сводка (котировки + главное), 19:00 — вечерний дайджест
@@ -115,10 +115,15 @@ REGIONS = {
     "US": {"flag": "🇺🇸", "name": "Vitis US", "env": "TG_CHAT_US"},
     "MACRO": {"flag": "🌍", "name": "Vitis Macro News", "env": "TG_CHAT_MACRO"},
     "CRYPTO": {"flag": "🪙", "name": "Vitis Crypto", "env": "TG_CHAT_CRYPTO"},
+    "OPINION": {"flag": "💬", "name": "Vitis Мнения", "env": "TG_CHAT_OPINION"},
 }
+# Тема для мнений и аналитики (колонки, разборы «что это значит», оценки аналитиков). По стране сюда ничего
+# не направляется — сюда уходит всё, что ИИ пометил как «мнение», из любого канала.
+# Пока секрет TG_CHAT_OPINION не задан, такие материалы просто не публикуются.
+OPINION_ON = bool(os.environ.get("TG_CHAT_OPINION")) or os.environ.get("DRY_RUN", "") not in ("", "0", "false")
 # Крипто-канал выключен, пока не задан секрет TG_CHAT_CRYPTO: ленты не опрашиваются, лимит ИИ не тратится
 CRYPTO_ON = bool(os.environ.get("TG_CHAT_CRYPTO")) or os.environ.get("DRY_CRYPTO") == "1"
-ACTIVE = [r for r in REGIONS if r != "CRYPTO" or CRYPTO_ON]
+ACTIVE = [r for r in REGIONS if r != "OPINION" and (r != "CRYPTO" or CRYPTO_ON)]
 
 # Календарь Forex Factory: страна → канал (глобальная макро идёт в US)
 CALENDAR_COUNTRIES = {"USD": "US", "EUR": "US", "JPY": "US", "CNY": "US"}
@@ -268,7 +273,7 @@ SKIP_PATTERNS = [
 KASE_ROUTINE = re.compile(r"облигац|купон|МЕУКАМ|МЕОКАМ|МЕККАМ|МЕУЖКАМ|нот\w* Национального Банка|подписк|"
                           r"специализированные торги|репо|иностранными валютами|своп|паев|ETF|"
                           r"маркет-мейкер|официальн\w+ списк", re.I)
-SKIP_URL = ["/personal-finance/", "/opinion/", "/opinions/", "/video/", "/videos/", "/sponsored",
+SKIP_URL = ["/personal-finance/", "/video/", "/videos/", "/sponsored",
             "/lifestyle/", "/sports/", "/podcast", "fool.com", "/live-blog", "/review/"]
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -278,8 +283,8 @@ SYSTEM_PROMPT = """Ты — редактор новостной ленты дл�
 Она ведёт фонд корейских акций (Vitis Korea Fund) и следит за Казахстаном (KASE, AIX, тенге, \
 нефть, уран), США/глобальными рынками (Fed, CPI, крупный тех) и геополитикой (канал Macro).
 
-Нужны ТОЛЬКО НОВОСТИ про компании и макро: события, решения, отчёты, сделки, данные, \
-движения рынков. НЕ нужны: колонки и мнения, аналитические эссе и разборы «почему», \
+Нужны НОВОСТИ про компании и макро: события, решения, отчёты, сделки, данные, \
+движения рынков. {opinion_rule} НЕ нужны: \
 советы инвесторам, «какие акции купить», личные финансы, обзоры продуктов, лайфстайл, \
 интервью без новостей, промо, спорт, новинки и рестайлинг моделей авто/гаджетов, \
 фото и слухи о продуктах без финансового эффекта для компании.
@@ -289,7 +294,8 @@ SYSTEM_PROMPT = """Ты — редактор новостной ленты дл�
 - "kind": "company" (новость компании), "macro" (экономика, центробанки, данные, \
 политика с влиянием на экономику), "market" (движения индексов, валют, сырья, облигаций), \
 "geo" (геополитика: войны, удары, перемирия, санкции, торговые войны, перевороты, выборы), \
-или "other" (всё, что не новость — такое мы НЕ публикуем)
+"opinion" (мнение или аналитика, а не событие — см. выше), \
+или "other" (всё остальное, что не новость, — такое мы НЕ публикуем)
 - "region": в какой канал (по содержанию, не по сайту!): \
 "MACRO" — геополитика и международная политика: войны и удары (Иран, Израиль, Россия/Украина, \
 Тайвань, КНДР), перемирия и переговоры, санкции и экспортный контроль, пошлины и торговые войны, \
@@ -326,7 +332,10 @@ Hyundai и других тяжеловесов KOSPI, чипы, потоки и�
 Личные дела владельцев чеболей — 3 и только если затрагивают контроль или пакет акций. \
 Общество, спорт, внутренняя политика без влияния на рынок — 1.
 {crypto_scale}   MACRO: 4+ — эскалация или деэскалация с эффектом для нефти, валют, рынков: новые удары и фронты, \
-перемирие, новые пакеты санкций, пошлины. Рутинные сводки с фронта, заявления без действий — 2.
+перемирие, новые пакеты санкций, пошлины; а также официальные позиции сторон по переговорам в активных \
+конфликтах (Иран–США, Россия–Украина, Израиль): условия и ультиматумы, начало, срыв или перенос переговоров, \
+отказ от диалога. 3 — заметные события без прямого эффекта для рынков. \
+2 — рутинные сводки с фронта, комментарии экспертов, заявления второстепенных лиц без новых фактов.
 - "title_ru": заголовок по-русски, коротко и по делу, как в новостном агентстве (до 110 знаков)
 - "summary": суть по-русски, 2–3 коротких предложения: что произошло, ключевые цифры, контекст. \
 Только факты из текста, без воды
@@ -342,20 +351,27 @@ Hyundai и других тяжеловесов KOSPI, чипы, потоки и�
 косвенная связь (тот же сектор, «может повлиять») — НЕ считается; иначе []
 - "dup": true, если это ТО ЖЕ СОБЫТИЕ, что в «недавно отправлено» или выше в этом списке, — даже если \
 издание другое и слова другие (напр. «KOSPI превысил 5000» и «Kospi подскочил выше 5000 на ралли чипов» — \
-одно событие; пересказ, реакция рынка и «что это значит» про уже отправленное событие — тоже dup). \
+одно событие; пересказ и реакция рынка на уже отправленное событие — тоже dup). Для "opinion" dup — \
+только если это тот же самый материал или та же мысль от другого издания. \
 Из нескольких версий одного события оставь одну — самую полную, остальным ставь dup
 
 Watchlist: {watchlist}
 
 Ответь ТОЛЬКО массивом JSON."""
 
+OPINION_RULE = ('Отдельно помечай kind="opinion": колонки и мнения, аналитические эссе, разборы «почему» и «что это '
+                'значит», оценки и прогнозы аналитиков и банков, «аналитики обсуждают…», «риски…», вопросы в '
+                'заголовке. Их оценивай по важности темы для инвестора (3 — содержательный разбор заметной темы, '
+                '4 — сильный материал о главном событии дня; пустые рассуждения — 1–2), region — по теме.')
+OPINION_OFF = "Колонки, мнения, аналитические эссе и разборы «почему» не нужны — помечай их kind=\"opinion\"."
 CRYPTO_REGION = ('; "CRYPTO" — криптовалюты и крипторынок: биткоин, эфир, альткоины, биржи, стейблкоины, '
                  'крипто-ETF, регулирование крипты, взломы')
 CRYPTO_SCALE = ("   CRYPTO: 4+ — события, которые двигают рынок: решения регуляторов (SEC, ETF, законы), притоки/оттоки "
                 "ETF, взломы и банкротства бирж, движение BTC/ETH больше 5% за день, крупные листинги и делистинги, "
                 "разблокировки токенов от $100 млн, покупки публичных компаний и государств. Прогнозы цен, мнения "
                 "«аналитиков», мемкоины, реклама проектов, «топ монет для покупки», технический анализ — 1–2.\n")
-KIND_LABEL = {"company": "🏢 Компании", "macro": "🏛 Макро", "market": "📊 Рынки", "geo": "🌍 Геополитика"}
+KIND_LABEL = {"company": "🏢 Компании", "macro": "🏛 Макро", "market": "📊 Рынки", "geo": "🌍 Геополитика",
+              "opinion": "💬 Мнение / аналитика"}
 
 
 # ───────────────────────── сеть ─────────────────────────
@@ -658,6 +674,8 @@ def similar(a, b):
     return len(wa & wb) / len(wa | wb) >= 0.5
 
 
+if not OPINION_ON:
+    SKIP_URL += ["/opinion/", "/opinions/"]
 SKIP_RE = re.compile("|".join(SKIP_PATTERNS), re.I)
 
 
@@ -771,6 +789,7 @@ def score_chunk(items, recent_titles):
     recent = "\n".join(f"- {t}" for t in recent_titles[-40:]) or "(пусто)"
     user = f"Недавно отправлено:\n{recent}\n\nНовые новости:\n\n" + "\n\n".join(lines)
     system = (SYSTEM_PROMPT.replace("{watchlist}", ", ".join(WATCHLIST))
+              .replace("{opinion_rule}", OPINION_RULE if OPINION_ON else OPINION_OFF)
               .replace("{crypto_region}", CRYPTO_REGION if CRYPTO_ON else "")
               .replace("{crypto_scale}", CRYPTO_SCALE if CRYPTO_ON else ""))
     result = extract_json(ask_ai(system, user, max_tokens=400 * len(items) + 800, as_json=True))
@@ -830,8 +849,11 @@ def importance(score):
 
 def format_post(it):
     title = it.get("title_ru") or it["title"]
-    head = f"{REGIONS[it['region']]['flag']} <b>{esc(title)}</b>"
+    flag = REGIONS[it["region"]]["flag"] + (REGIONS[it["about"]]["flag"] if it.get("about") in REGIONS else "")
+    head = f"{flag} <b>{esc(title)}</b>"
     meta = ["⚡️ Срочно · без перевода" if it.get("raw") else importance(it["score"])]
+    if it.get("kind") == "opinion":
+        meta = []   # у мнения нет «срочности» — только пометка, что это мнение
     if KIND_LABEL.get(it.get("kind")):
         meta.append(KIND_LABEL[it["kind"]])
     if it["watch"]:
@@ -936,7 +958,7 @@ def calendar_section(state, now, region):
 # ───────────────────────── дайджест ─────────────────────────
 
 def num(x, dec=2):
-    if abs(x) >= 10000 and dec == 2:
+    if abs(x) >= 100000 and dec == 2:
         dec = 0          # 189 400, а не 189 400,00
     return f"{x:,.{dec}f}".replace(",", " ").replace(".", ",")
 
@@ -1066,8 +1088,8 @@ def crypto_block():
                      f"объём ${bln(c.get('total_volume'))})")
     ranked = sorted(coins, key=lambda c: c["price_change_percentage_24h"])
     mv = lambda cs: ", ".join(f"{c['symbol'].upper()} {pct(c['price_change_percentage_24h'])}" for c in cs)
-    up = [c for c in ranked[::-1] if c["price_change_percentage_24h"] > 0][:3]
-    down = [c for c in ranked if c["price_change_percentage_24h"] < 0][:3]
+    up = [c for c in ranked[::-1] if c["price_change_percentage_24h"] >= 0.05][:3]
+    down = [c for c in ranked if c["price_change_percentage_24h"] <= -0.05][:3]
     text = ("<pre>" + "\n".join(rows) + "</pre>\n"
             f"📈 <b>Растут (топ-30, 24ч):</b> {mv(up) or '—'}\n📉 <b>Падают:</b> {mv(down) or '—'}")
     plain += [f"растут: {mv(up)}", f"падают: {mv(down)}"]
@@ -1081,9 +1103,11 @@ def crypto_block():
         plain.append(f"самый высокий оборот: {tv}")
     try:
         g = json.loads(fetch("https://api.coingecko.com/api/v3/global", timeout=15))["data"]
+        vol = (g.get("total_volume") or {}).get("usd")
         text += (f"\n🌐 <b>Весь рынок:</b> капитализация ${g['total_market_cap']['usd'] / 1e12:.2f} трлн "
-                 f"({pct(g['market_cap_change_percentage_24h_usd'])} за 24ч), объём ${bln(g['total_volume']['usd'])}, "
-                 f"доля BTC {g['market_cap_percentage']['btc']:.1f}%").replace(".", ",")
+                 f"({pct(g['market_cap_change_percentage_24h_usd'])} за 24ч)"
+                 + (f", объём ${bln(vol)}" if vol else "")
+                 + f", доля BTC {g['market_cap_percentage']['btc']:.1f}%").replace(".", ",")
         plain.append(f"капитализация рынка {pct(g['market_cap_change_percentage_24h_usd'])} за 24ч")
     except Exception as e:
         print(f"CoinGecko global не ответил: {e}", file=sys.stderr)
@@ -1405,7 +1429,7 @@ def check_news(state, now):
         print(f"{now:%H:%M} несрочных {len(todo)} — подождут следующей пачки")
         return
     quiet = in_quiet(now)
-    sent = {r: 0 for r in ACTIVE}
+    sent = {r: 0 for r in ACTIVE + (["OPINION"] if OPINION_ON else [])}
     all_ai = True
 
     def queue(it, summary=None):
@@ -1439,10 +1463,19 @@ def check_news(state, now):
             log.append((sc, "ДУБЛЬ (ИИ)", it)); return False
         if it.get("kind") == "other":
             log.append((sc, "не новость (ИИ)", it)); return False
+        if it.get("kind") == "opinion":      # мнения и аналитика — в отдельную тему, из любого канала
+            if not OPINION_ON or it["score"] < MIN_SCORE["OPINION"]:
+                log.append((sc, "мнение — отброшено", it)); return False
+            it["about"], it["region"] = reg, "OPINION"
+            reg = "OPINION"
+            if sum(1 for t, r in state["sent_log"] if r == reg and t > now_ts - 3600) >= MAX_PER_HOUR[reg]:
+                log.append((sc, "мнение — лимит в час", it)); return False
         if it["score"] < DROP_BELOW:
             log.append((sc, "отброшено", it)); return False
         hour = sum(1 for t, r in state["sent_log"] if r == reg and t > now_ts - 3600)
         ok = it["score"] >= MIN_SCORE[reg] and (not quiet or it["score"] == 5 or (it["prio"] and it["score"] >= 4))
+        if reg == "OPINION" and not ok:      # ночью мнения не копим в дайджест
+            log.append((sc, "мнение — тихие часы", it)); return False
         if ok and it["score"] < 5 and hour >= MAX_PER_HOUR[reg]:
             queue(it); log.append((sc, f"лимит в час → дайджест {reg}", it)); return False
         if ok:
