@@ -53,7 +53,6 @@ ALERT_FEEDS = [
     ("KASE", "html:https://kase.kz/ru/information/news/companies"),
     ("KASE", "html:https://kase.kz/ru/information/news/exchange"),
     ("KASE", gnews("site:kase.kz облигации when:2d", "ru", "KZ")),
-    ("AIX", "https://aix.kz/feed/"),
     ("AIX", gnews("site:aix.kz (bonds OR notes OR sukuk OR Eurobond) when:3d")),
     ("AIX", gnews('"AIX" Kazakhstan (bonds OR Eurobonds) when:2d')),
     ("Рейтинги", gnews("(Fitch OR Moody's OR \"S&P\") Kazakhstan rating when:2d")),

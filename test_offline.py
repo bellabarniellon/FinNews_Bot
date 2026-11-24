@@ -19,6 +19,7 @@ import bot, bonds
 
 bot.QUIET_FROM = bot.QUIET_TO = 0      # тест не зависит от времени суток
 bot.SEND_IMAGES = False
+bot.HOLD_MIN = 0       # в тесте не копим пачку
 SENT = []
 _tg = bot.tg
 bot.tg = lambda m, p, retry=True: (SENT.append((p["chat_id"], p.get("text") or p.get("caption"))), _tg(m, p))[1]

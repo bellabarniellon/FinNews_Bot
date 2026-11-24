@@ -103,7 +103,9 @@ LOCAL_TZ = timezone(timedelta(hours=5))
 
 TOKEN = os.environ.get("TG_TOKEN", "")
 PERSONAL = [c.strip() for c in os.environ.get("TG_CHAT_ID", "").split(",") if c.strip()]
-API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+# Платный Claude выключен: работает только бесплатный Gemini. Чтобы включить Claude Haiku как запасной,
+# нужны ОБА условия: секрет ANTHROPIC_API_KEY и переменная USE_CLAUDE=1
+API_KEY = os.environ.get("ANTHROPIC_API_KEY", "") if os.environ.get("USE_CLAUDE") == "1" else ""
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "")
 AI_ON = bool(GEMINI_KEY or API_KEY)
 INTERVAL = int(os.environ.get("INTERVAL_SEC", "120"))
@@ -112,7 +114,8 @@ STATE_FILE = os.environ.get("STATE_FILE", "seen.dry.json" if DRY_RUN else "seen.
 SEC_UA = os.environ.get("SEC_UA", "")   # для SEC EDGAR нужен User-Agent вида "Имя email@домен"
 GNEWS_EVERY = 3        # ленты через Google News опрашиваем раз в 3 цикла (иначе Google режет запросы)
 MAX_PER_CYCLE = 150
-AI_CHUNK = 10          # маленькие пачки — ответ ИИ не обрезается
+AI_CHUNK = 12          # небольшие пачки — ответ ИИ не обрезается
+HOLD_MIN = 5           # несрочные новости копим до 5 штук или ~6 минут: меньше запросов к ИИ (лимит Gemini)
 MAX_AI_RETRIES = 3     # сколько раз пытаться оценить новость, если ИИ не ответил
 DESC_LIMIT = 600
 
@@ -164,22 +167,23 @@ FEEDS = [
     ("SEC 8-K", "US", ["sec:https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=8-K&company=&dateb="
                        "&owner=include&count=100&output=atom"], {"must": MEGACAP_RE}),
     # ─── 🇰🇷 Korea ───
-    ("Yonhap", "KR", [
-        "https://en.yna.co.kr/RSS/economy.xml",
-        "https://en.yna.co.kr/RSS/market.xml",
-    ]),
+    ("Yonhap", "KR", [gnews("site:en.yna.co.kr (economy OR market OR stocks OR company) when:1d")],
+     {"must": r"econom|market|stock|share|kospi|won\b|export|trade|rate|bank|chip|semiconductor|samsung|hynix|"
+              r"hyundai|\blg\b|\bsk\b|posco|earnings|profit|sales|invest|inflation|gdp|tariff|bok\b"}),
     ("Korea Herald", "KR", [gnews("site:koreaherald.com (business OR economy OR market) when:1d")]),
     ("KED Global", "KR", [gnews("site:kedglobal.com when:1d")]),
-    ("JoongAng Daily", "KR", [gnews("site:koreajoongangdaily.joins.com (business OR economy) when:1d")]),
+    ("JoongAng Daily", "KR", [gnews("site:koreajoongangdaily.joins.com when:1d")],
+     {"must": r"econom|market|stock|share|kospi|won\b|export|chip|semiconductor|samsung|hynix|hyundai|earnings|"
+              r"profit|invest|inflation|gdp|tariff|bank"}),
     ("BusinessKorea", "KR", [gnews("site:businesskorea.co.kr when:1d")]),
     ("Reuters Korea", "KR", [gnews("site:reuters.com (Korea OR KOSPI OR Samsung OR Hynix OR Hyundai) when:1d")],
      {"must": KOREA_RE}),
     ("CNBC Asia", "KR", ["https://www.cnbc.com/id/19832390/device/rss/rss.html"], {"must": KOREA_RE}),
     # ─── 🇰🇿 Kazakhstan ───
     ("KASE", "KZ", ["html:https://kase.kz/ru/information/news/all"]),
-    ("AIX", "KZ", ["https://aix.kz/feed/"]),
+    ("AIX", "KZ", [gnews("site:aix.kz when:3d")]),
     ("Kursiv", "KZ", ["https://kz.kursiv.media/feed/"]),
-    ("Kapital.kz", "KZ", ["https://kapital.kz/rss"]),
+    ("Kapital.kz", "KZ", [gnews("site:kapital.kz when:1d", "ru", "KZ")]),   # их собственный RSS отвечает 403
     ("Interfax KZ", "KZ", [gnews("site:interfax.kz when:1d", "ru", "KZ")]),
     ("НБК", "KZ", [gnews("site:nationalbank.kz when:2d", "ru", "KZ")]),
     ("Reuters KZ", "KZ", [gnews("site:reuters.com (Kazakhstan OR tenge OR Kazatomprom OR Kaspi) when:2d")],
@@ -360,20 +364,26 @@ def send(text):  # служебные сообщения — в личку
     send_text(PERSONAL, text)
 
 
-_gemini_state = {"model": 0, "thinking": True}
+# Как просить модель «не размышлять» (размышления съедают лимит ответа): у Gemini 3.x это
+# thinkingLevel, у 2.x — thinkingBudget; если модель не принимает ни то ни другое — без параметра.
+THINK_MODES = [{"thinkingLevel": "minimal"}, {"thinkingBudget": 0}, None]
+_gemini_state = {"model": 0, "mode": {}}
 
 
 def ask_gemini(system, user, max_tokens, as_json):
-    for _ in range(len(GEMINI_MODELS) * 2):
+    for _ in range(len(GEMINI_MODELS) * 5):
         if _gemini_state["model"] >= len(GEMINI_MODELS):
             _gemini_state["model"] = 0
             return None
         model = GEMINI_MODELS[_gemini_state["model"]]
-        cfg = {"maxOutputTokens": max_tokens, "temperature": 0.2}
+        mode_i = _gemini_state["mode"].setdefault(model, 1 if "-2." in model else 0)
+        think = THINK_MODES[mode_i]
+        # без явного отключения размышлений даём запас по длине ответа
+        cfg = {"maxOutputTokens": max_tokens if think else max_tokens * 3, "temperature": 0.2}
         if as_json:
             cfg["responseMimeType"] = "application/json"
-        if _gemini_state["thinking"]:
-            cfg["thinkingConfig"] = {"thinkingBudget": 0}  # без «размышлений»: они съедают лимит ответа
+        if think:
+            cfg["thinkingConfig"] = think
         body = json.dumps({
             "systemInstruction": {"parts": [{"text": system}]},
             "contents": [{"role": "user", "parts": [{"text": user}]}],
@@ -392,15 +402,20 @@ def ask_gemini(system, user, max_tokens, as_json):
             return text
         except urllib.error.HTTPError as e:
             msg = e.read().decode("utf-8", "ignore")
-            print(f"Gemini ({model}) error {e.code}: {msg[:250]}", file=sys.stderr)
-            if e.code == 400 and _gemini_state["thinking"] and "think" in msg.lower():
-                _gemini_state["thinking"] = False
+            print(f"Gemini ({model}, {json.dumps(think)}) error {e.code}: {msg[:250]}", file=sys.stderr)
+            if e.code == 400 and "model" not in msg.lower() and mode_i + 1 < len(THINK_MODES):
+                _gemini_state["mode"][model] = mode_i + 1   # «invalid argument» — пробуем другой способ
                 continue
-            if e.code in (404, 429) or (e.code == 400 and "model" in msg.lower()):
+            if e.code in (400, 404, 429):
                 _gemini_state["model"] += 1  # следующая модель
                 continue
             if e.code in (500, 502, 503, 504):
-                time.sleep(5)
+                if _gemini_state.setdefault("busy", 0) < 1:
+                    _gemini_state["busy"] += 1
+                    time.sleep(5)
+                    continue
+                _gemini_state["busy"] = 0
+                _gemini_state["model"] += 1
                 continue
             return None
         except Exception as e:
@@ -1027,6 +1042,12 @@ def check_news(state, now):
     for it in todo:
         it["prio"] = is_breaking(it)
     todo.sort(key=lambda x: (not x["prio"], x.get("ts") or 0))   # срочные — первыми
+    if (AI_ON and todo and not SAMPLE and not any(it["prio"] for it in todo)
+            and len(todo) < HOLD_MIN and _cycle["n"] % GNEWS_EVERY != 0):
+        state["pending"] = [{k: it.get(k) for k in ("id", "title", "link", "desc", "image", "ts", "source",
+                                                     "region", "tries")} for it in todo]
+        print(f"{now:%H:%M} несрочных {len(todo)} — подождут следующей пачки")
+        return
     quiet = in_quiet(now)
     sent = {r: 0 for r in REGIONS}
     all_ai = True
@@ -1046,10 +1067,10 @@ def check_news(state, now):
                 state["recent"].append({"title": it["title"], "ts": now_ts})
                 log.append(("4/5", f"⚡️ без ИИ → {it['region']}", it))
                 return True
-            it["tries"] = it.get("tries", 0) + 1
+            it["tries"] = (it.get("tries") or 0) + 1
             if it["tries"] < MAX_AI_RETRIES:
                 state.setdefault("pending", []).append(
-                    {k: it[k] for k in ("id", "title", "link", "desc", "image", "ts", "source", "region", "tries")})
+                    {k: it.get(k) for k in ("id", "title", "link", "desc", "image", "ts", "source", "region", "tries")})
                 log.append(("   ", "ждёт ИИ (повтор)", it))
             else:
                 log.append(("   ", "без ИИ — отброшено", it))
