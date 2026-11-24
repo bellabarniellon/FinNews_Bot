@@ -9,6 +9,10 @@ on:
         description: "Тест без Telegram: посты только в лог запуска"
         type: boolean
         default: false
+      brief:
+        description: "Показать утреннюю сводку прямо сейчас (вместе с dry_run — только в лог)"
+        type: boolean
+        default: false
       sample:
         description: "Для теста: взять N свежих новостей из каждой ленты (0 — только новые)"
         default: "0"
@@ -17,7 +21,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: news-bot${{ inputs.dry_run && '-dry' || '' }}   # тест не ждёт очереди за боевым запуском
+  group: news-bot${{ (inputs.dry_run || inputs.brief) && '-dry' || '' }}   # тест не ждёт очереди за боевым запуском
   cancel-in-progress: false
 
 jobs:
@@ -32,7 +36,8 @@ jobs:
       - name: Check news
         run: >
           python bot.py
-          ${{ inputs.dry_run && '--once' || '--minutes 50' }}
+          ${{ inputs.brief && '--brief' || '' }}
+          ${{ (inputs.dry_run || inputs.brief) && '--once' || '--minutes 50' }}
           ${{ inputs.dry_run && inputs.sample != '0' && format('--sample {0}', inputs.sample) || '' }}
         env:
           DRY_RUN: ${{ inputs.dry_run && '1' || '' }}
@@ -42,6 +47,9 @@ jobs:
           TG_CHAT_KR: ${{ secrets.TG_CHAT_KR }}
           TG_CHAT_US: ${{ secrets.TG_CHAT_US }}
           TG_CHAT_MACRO: ${{ secrets.TG_CHAT_MACRO }}
+          TG_CHAT_CRYPTO: ${{ secrets.TG_CHAT_CRYPTO }}
+          TG_CHAT_RADAR: ${{ secrets.TG_CHAT_RADAR }}
+          DRY_CRYPTO: ${{ inputs.dry_run && '1' || '' }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           SEC_UA: ${{ vars.SEC_UA }}
@@ -51,7 +59,7 @@ jobs:
           MIN_SCORE_MACRO: ${{ vars.MIN_SCORE_MACRO }}
           INTERVAL_SEC: "120"
       - name: Save state
-        if: ${{ always() && !inputs.dry_run }}
+        if: ${{ always() && !inputs.dry_run && !inputs.brief }}
         run: |
           git config user.name "news-bot"
           git config user.email "news-bot@users.noreply.github.com"
