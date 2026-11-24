@@ -101,7 +101,7 @@ BRIEF_QUOTES = {
     "US": [("S&P 500", "^GSPC"), ("Nasdaq", "^IXIC"), ("Dow Jones", "^DJI"), ("UST 10Y", "^TNX"), ("DXY", "DX-Y.NYB")],
     "KR": [("KOSPI", "^KS11"), ("KOSDAQ", "^KQ11"), ("USD/KRW", "KRW=X"), ("Samsung", "005930.KS"),
            ("SK Hynix", "000660.KS")],
-    "KZ": [("USD/KZT", "KZT=X"), ("Brent", "BZ=F"), ("Kaspi ADR", "KSPI")],   # + индекс KASE из новостей биржи
+    "KZ": [("Brent", "BZ=F"), ("Kaspi ADR", "KSPI")],   # + индекс KASE из новостей биржи и курс НБК
     "MACRO": [("VIX", "^VIX"), ("Brent", "BZ=F"), ("WTI", "CL=F"), ("Gold", "GC=F"), ("DXY", "DX-Y.NYB"),
               ("UST 10Y", "^TNX")],
 }
@@ -400,8 +400,11 @@ def target(chat):
 
 
 def send_text(chats, text):
-    if len(text) > 4000:
-        text = text[:3990] + "…"
+    if len(text) > 4000:   # режем по границе строки и закрываем незакрытые теги
+        text = text[:3900].rsplit("\n", 1)[0] + "\n…"
+        for t in ("pre", "blockquote", "b", "i"):
+            if text.count(f"<{t}>") > text.count(f"</{t}>"):
+                text += f"</{t}>"
     for chat in chats:
         tg("sendMessage", {**target(chat), "text": text, "parse_mode": "HTML",
                            "disable_web_page_preview": "true"})
@@ -933,6 +936,8 @@ def calendar_section(state, now, region):
 # ───────────────────────── дайджест ─────────────────────────
 
 def num(x, dec=2):
+    if abs(x) >= 10000 and dec == 2:
+        dec = 0          # 189 400, а не 189 400,00
     return f"{x:,.{dec}f}".replace(",", " ").replace(".", ",")
 
 
@@ -954,14 +959,59 @@ def yahoo_quote(sym):
             "live": (live / close - 1) * 100 if live else None}
 
 
+KASE_IDX_RE = re.compile(r"(\d{1,2} [а-я]+) значение Индекса KASE (\w+) на ([\d,]+)\s*% до ([\d\s\u00a0,]+\d)")
+
+
+def kase_index_from(title):
+    m = KASE_IDX_RE.search(title)
+    if not m:
+        return None
+    sign = "−" if m.group(2).startswith(("сниз", "упал", "пониз")) else "+"
+    return {"date": m.group(1), "val": m.group(4).replace("\u00a0", " "), "chg": f"{sign}{m.group(3)}%"}
+
+
+def nbk_usd(day):
+    """Официальный курс USD/KZT Нацбанка на дату."""
+    xml = fetch(f"https://nationalbank.kz/rss/get_rates.cfm?fdate={day:%d.%m.%Y}", timeout=15).decode("utf-8", "ignore")
+    m = re.search(r"<title>\s*USD\s*</title>\s*<description>\s*([\d.,]+)", xml)
+    return float(m.group(1).replace(",", "."))
+
+
+def kzt_row(now):
+    """→ (значение, изменение, пометка) по курсу НБК; если сайт НБК не ответил — по Yahoo."""
+    try:
+        today = nbk_usd(now)
+        prev = next(r for r in (nbk_usd(now - timedelta(days=d)) for d in (1, 2, 3, 4)) if abs(r - today) > 1e-9)
+        return num(today), f"{(today / prev - 1) * 100:+.2f}%".replace(".", ","), "курс НБК"
+    except Exception as e:
+        print(f"Курс НБК не загрузился ({e}) — беру Yahoo", file=sys.stderr)
+        q = yahoo_quote("KZT=X")
+        return num(q["close"]), f"{q['chg']:+.2f}%".replace(".", ","), "Yahoo"
+
+
 def quotes_block(state, region):
     """→ (текст с таблицей, строки для ИИ)."""
     rows, plain, live, dates = [], [], [], set()
-    k = state.get("kase_index")
-    if region == "KZ" and k:
-        rows.append(f"{'Индекс KASE':<12}{k['val']:>11}{k['chg']:>9}")
-        plain.append(f"Индекс KASE {k['val']} ({k['chg']})")
-        dates.add(k["date"])
+    notes = []
+    if region == "KZ":
+        k = state.get("kase_index")
+        if not k:   # в состоянии ещё нет — смотрим страницу новостей биржи
+            try:
+                for it in parse_html_news(fetch("https://kase.kz/ru/information/news/all"), "https://kase.kz"):
+                    k = k or kase_index_from(it["title"])
+            except Exception as e:
+                print(f"Индекс KASE не найден: {e}", file=sys.stderr)
+        if k:
+            rows.append(f"{'Индекс KASE':<12}{k['val']:>11}{k['chg']:>9}")
+            plain.append(f"Индекс KASE {k['val']} ({k['chg']})")
+            notes.append(f"KASE за {k['date']}")
+        try:
+            val, chg, src = kzt_row(datetime.now(LOCAL_TZ))
+            rows.append(f"{'USD/KZT':<12}{val:>11}{chg:>9}")
+            plain.append(f"USD/KZT {val} ({chg}, {src})")
+            notes.append(f"USD/KZT — {src}")
+        except Exception as e:
+            print(f"USD/KZT не загрузился: {e}", file=sys.stderr)
     with ThreadPoolExecutor(6) as ex:
         def one(pair):
             try:
@@ -984,7 +1034,8 @@ def quotes_block(state, region):
             live.append(f"{name} {q['live']:+.2f}%".replace(".", ","))
     if not rows:
         return "", []
-    text = "<pre>" + "\n".join(rows) + "</pre>\n<i>Закрытие " + ", ".join(sorted(dates)) + "</i>"
+    text = ("<pre>" + "\n".join(rows) + "</pre>\n<i>" + "; ".join(
+        ([f"Закрытие {', '.join(sorted(dates))}"] if dates else []) + notes) + "</i>")
     if live:
         text += "\n<i>Сейчас торгуется:</i> " + " · ".join(live)
     return text, plain
@@ -994,12 +1045,15 @@ def crypto_block():
     """Рынок крипты (CoinGecko, без ключа): BTC, ETH, лидеры роста и падения среди топ-30, индекс страха."""
     try:
         coins = json.loads(fetch("https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd"
-                                 "&order=market_cap_desc&per_page=40&price_change_percentage=24h,7d", timeout=20))
+                                 "&order=market_cap_desc&per_page=60&price_change_percentage=24h,7d", timeout=20))
     except Exception as e:
         print(f"CoinGecko не ответил: {e}", file=sys.stderr)
         return "", []
     stable = {"usdt", "usdc", "dai", "usde", "fdusd", "usds", "pyusd", "usd1", "wbtc", "steth", "wsteth", "weth"}
-    coins = [c for c in coins if c.get("symbol") not in stable and c.get("price_change_percentage_24h") is not None][:30]
+    stable |= {"usdg", "usdtb", "susde", "susds", "usd0", "usdy", "rlusd", "buidl", "bsc-usd", "usdf", "usdx", "eurc",
+               "xaut", "paxg", "wbeth", "weeth", "reth", "cbbtc", "lbtc", "solvbtc", "jitosol", "bnsol", "ezeth"}
+    coins = [c for c in coins if c.get("symbol") not in stable and c.get("price_change_percentage_24h") is not None
+             and not (abs((c.get("current_price") or 0) - 1) < 0.02 and abs(c["price_change_percentage_24h"]) < 0.5)][:30]
     pct = lambda x: f"{x:+.1f}%".replace(".", ",")
     bln = lambda x: (f"{x / 1e9:.1f}".replace(".", ",") + " млрд") if x else "—"
     rows, plain = [f"{'':<5}{'Цена, $':>10}{'24ч':>8}{'7д':>8}{'Объём 24ч':>12}"], []
@@ -1116,7 +1170,8 @@ def radar_text(state, now):
         def table(items):
             return "\n".join(f"{names[t][:18]:<18}{pct(s['d']):>7}{pct(s['w']):>8}{pct(s['m']):>8}"
                              + (f"  ×{x1(s['vol'])}" if s["vol"] >= 1.5 else "") for t, s in items)
-        txt = ("🏭 <b>Отрасли: лидеры недели</b>\n<pre>" + f"{'':<18}{'день':>7}{'неделя':>8}{'месяц':>8}\n"
+        growing = sum(1 for _, s in ind if s["w"] > 0)
+        txt = (f"🏭 <b>Отрасли: лидеры недели</b> <i>(растут {growing} из {len(ind)})</i>\n<pre>" + f"{'':<18}{'день':>7}{'неделя':>8}{'месяц':>8}\n"
                + table(ind[:7]) + "</pre>")
         if len(ind) > 10:
             txt += "\n<b>Аутсайдеры недели</b>\n<pre>" + table(ind[-3:]) + "</pre>"
@@ -1148,7 +1203,8 @@ def send_digest(state, now, region, brief=False):
         if brief:
             lst = ("Рынок: " + "; ".join(plain) + "\n\nУже отправлено в ленту за сутки:\n"
                    + "\n".join(f"- ({s['s']}/5) {s['t']}" for s in sent[-30:]) + "\n\nНе вошло в ленту:\n" + lst)
-            ask = ("Ты — редактор утренней сводки для инвест-аналитика. Напиши по-русски 2–3 коротких предложения: "
+            ask = ("Ты — редактор утренней сводки для инвест-аналитика. Напиши по-русски 2–3 коротких предложения "
+                   "(всего не длиннее 450 знаков): "
                    "чем закрылся рынок и что было главным за сутки. Только факты и цифры из данных ниже, "
                    "без советов, прогнозов и рекомендаций что покупать. Без вступления и без списков.")
         else:
@@ -1160,7 +1216,7 @@ def send_digest(state, now, region, brief=False):
             parts.append("<b>Главное</b>\n<blockquote>" + esc(text.strip()) + "</blockquote>")
     if queue:
         lines = [f'{"📌 " if q.get("watch") else "▫️ "}<a href="{html.escape(q["link"])}">{esc(q["title"])}</a>'
-                 for q in queue[:10 if brief else 15]]
+                 for q in queue[:7 if brief else 15]]
         parts.append(f"<b>{'Не вошло в ленту' if brief else 'Все новости'}</b>\n" + "\n".join(lines))
     if cal:
         parts.append(cal)
@@ -1284,11 +1340,9 @@ def check_news(state, now):
         first_time = source not in state["feeds"]
         if source == "KASE":
             for it in items:
-                m = re.search(r"(\d{1,2} [а-я]+) значение Индекса KASE (\w+) на ([\d,]+)\s*% до ([\d\s\u00a0,]+\d)", it["title"])
-                if m:
-                    sign = "−" if m.group(2).startswith(("сниз", "упал", "пониз")) else "+"
-                    state["kase_index"] = {"date": m.group(1), "val": m.group(4).replace("\u00a0", " "),
-                                           "chg": f"{sign}{m.group(3)}%"}
+                k = kase_index_from(it["title"])
+                if k:
+                    state["kase_index"] = k
                     break
         if SAMPLE:  # тестовый режим: берём N свежих из каждой ленты, даже если уже видели
             items = sorted(items, key=lambda x: x["ts"] or 0)[-SAMPLE:]
