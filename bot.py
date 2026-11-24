@@ -1102,7 +1102,12 @@ def crypto_block():
         text += f"\n🔥 <b>Самый высокий оборот</b> <i>(объём за 24ч к капитализации)</i>: {tv}"
         plain.append(f"самый высокий оборот: {tv}")
     try:
-        g = json.loads(fetch("https://api.coingecko.com/api/v3/global", timeout=15))["data"]
+        time.sleep(0 if SAMPLE and not GEMINI_KEY else 3)   # два запроса подряд CoinGecko режет (429)
+        try:
+            g = json.loads(fetch("https://api.coingecko.com/api/v3/global", timeout=15))["data"]
+        except urllib.error.HTTPError:
+            time.sleep(8)
+            g = json.loads(fetch("https://api.coingecko.com/api/v3/global", timeout=15))["data"]
         vol = (g.get("total_volume") or {}).get("usd")
         text += (f"\n🌐 <b>Весь рынок:</b> капитализация ${g['total_market_cap']['usd'] / 1e12:.2f} трлн "
                  f"({pct(g['market_cap_change_percentage_24h_usd'])} за 24ч)"
