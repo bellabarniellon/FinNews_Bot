@@ -1,0 +1,17 @@
+<b>Method</b>
+
+1. Today's market state is described by a set of features: S&amp;P 500 and KOSPI drawdowns from their 1-year highs, the speed and volatility of the fall, VIX, and 3-month changes in the UST yield, gold, oil and the won.
+2. The 50 most similar dates since 1990 are found. The model takes what every asset actually did over the next 126 trading days, so crisis co-movement between assets is preserved.
+3. Equities also use a crash library of seven indices (S&amp;P 500, KOSPI, Nasdaq, Nikkei, Hang Seng, Taiwan, Shanghai).
+4. Each asset's final range blends three estimates: analogs, the crash library and plain history. The weights come from a walk-forward backtest, monthly since 2000, using only data available at each date.
+
+<b>What the backtest showed</b>
+• Ranges are calibrated: for the S&amp;P 500 in stress months, about 85% of outcomes fell inside the 90% range, versus 67% for plain history.
+• On 6-month direction the model is only slightly better than plain history. Its strength is the width of the range and the tails; the median is secondary.
+
+<b>Limits</b>
+• Comparable episodes are few, especially for falls as deep as KOSPI's.
+• Tenge: the range comes from post-2015 history. Brent, the ruble and the won explain about half of monthly moves, and the link has weakened since 2022. A sudden devaluation is under-represented.
+• The model has no earnings, valuation or view on what caused the sell-off.
+
+Data: Investing.com and FRED. Not investment advice.

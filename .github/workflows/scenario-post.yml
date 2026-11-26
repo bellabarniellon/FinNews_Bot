@@ -1,0 +1,36 @@
+name: scenario-post
+
+on:
+  push:
+    branches: [main]
+    paths: ["scenario/latest/meta.json"]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Тест без Telegram: только лог запуска"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: scenario-post
+  cancel-in-progress: false
+
+jobs:
+  send:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install --quiet requests
+      - name: Send scenario post
+        run: python scenario/send.py
+        env:
+          DRY_RUN: ${{ inputs.dry_run && '1' || '' }}
+          TG_TOKEN: ${{ secrets.TG_TOKEN }}
+          TG_CHAT_RADAR: ${{ secrets.TG_CHAT_RADAR }}
