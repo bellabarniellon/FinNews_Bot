@@ -1,6 +1,5 @@
-Scenario analyser, data through 25 Nov 2026
+Scenario analyser, data through 26 Nov 2026
 
-Medians, 6 months: S&P 500 +4.2%, KOSPI +5.0%, Gold +1.0%, Brent −7.8%, US 10y yield −0.1 pp, USD/KZT +1.6%, USD/KRW +0.6%
+Medians, 6 months: S&P 500 +4.1%, KOSPI +4.3%, Gold +1.0%, Brent −7.8%, US 10y yield −0.1 pp, USD/KZT +1.5%, USD/KRW +0.6%
 
-What moved the numbers:
-• KOSPI: 5,006 → 4,698 (−6.2%); 6m median +4.9% → +5.0%
+No material changes since the previous run.
